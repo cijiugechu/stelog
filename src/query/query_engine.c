@@ -1022,7 +1022,7 @@ static void query_one_segment(const StelogIndex *idx,
     }
 
     uint32_t iter_n = use_bhits ? bhit_count : single_count;
-    if (iter_n > 0) {
+    if (iter_n > 0 && !q->existence_only) {
         uint32_t reserve_n = iter_n > 8192u ? 8192u : iter_n;
         cand_reserve(scratch, out_cands, out_cands->count + reserve_n);
     }
@@ -1103,6 +1103,7 @@ static void query_one_segment(const StelogIndex *idx,
         sc.ts_ms = ts;
         sc.score = idf_val * len_norm * rw * recency;
         cand_push(scratch, out_cands, sc);
+        if (q->existence_only) return;
     }
 }
 
@@ -1695,14 +1696,22 @@ int stelog_index_search(StelogIndex *idx, const StelogQuery *q, StelogSearchResu
         if (dt > max_ts) max_ts = dt;
     }
 
+    ScoredCand first_match;
     CandList cands = { NULL, 0, 0 };
+    if (q->existence_only) cands = (CandList){ &first_match, 0, 1 };
     uint32_t docs_in_scope = 0;
     query_one_segment(idx, &idx->base, false, q, &plan, re, re_matcher, agent_mask, role_mask,
                       proj_substr, actor_substr, session_id, since_ms, until_ms,
                       max_ts, &idx->scratch, &cands, &docs_in_scope);
-    query_one_segment(idx, &idx->delta, true,  q, &plan, re, re_matcher, agent_mask, role_mask,
-                      proj_substr, actor_substr, session_id, since_ms, until_ms,
-                      max_ts, &idx->scratch, &cands, &docs_in_scope);
+    if (!q->existence_only || !cands.count) {
+        query_one_segment(idx, &idx->delta, true,  q, &plan, re, re_matcher, agent_mask, role_mask,
+                          proj_substr, actor_substr, session_id, since_ms, until_ms,
+                          max_ts, &idx->scratch, &cands, &docs_in_scope);
+    }
+    if (q->existence_only) {
+        out->total_matches = cands.count;
+        goto done;
+    }
 
     out->docs_in_scope = docs_in_scope;
 

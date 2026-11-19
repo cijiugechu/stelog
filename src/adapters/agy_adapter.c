@@ -2,32 +2,34 @@
 #include "adapters/adapter.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <sqlite3.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
 
-void stelog_agy_discover(const char *agy_home, StelogFileList *out_files) {
-    if (!agy_home || !agy_home[0]) return;
-    char brain_dir[1024];
-    snprintf(brain_dir, sizeof(brain_dir), "%s/brain", agy_home);
-
+int stelog_agy_discover(const char *brain_dir, StelogFileList *out_files) {
     DIR *d = opendir(brain_dir);
-    if (!d) return;
+    if (!d) return errno;
+    int error = 0;
 
     struct dirent *ent;
     char path[1536];
-    while ((ent = readdir(d)) != NULL) {
+    while (errno = 0, (ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
         snprintf(path, sizeof(path), "%s/%s/.system_generated/logs/transcript.jsonl",
                  brain_dir, ent->d_name);
         struct stat st;
-        if (stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0) {
+        if (stat(path, &st) != 0) {
+            if (errno != ENOENT && errno != ENOTDIR) error = errno;
+        } else if (S_ISREG(st.st_mode) && st.st_size > 0) {
             stelog_filelist_add(out_files, STELOG_AGENT_AGY, path,
                                 ent->d_name, NULL, (uint64_t)st.st_size, false, false);
         }
     }
+    if (errno) error = errno;
     closedir(d);
+    return error;
 }
 
 /* Extract first clean local path from AGY workspace_uris (may be JSON array or file:// URI) */

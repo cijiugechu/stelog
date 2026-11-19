@@ -1,5 +1,13 @@
 const std = @import("std");
 
+fn buildCommit(b: *std.Build) []const u8 {
+    var code: u8 = undefined;
+    const output = b.runAllowFail(&.{
+        "git", "--git-dir", b.pathFromRoot(".git"), "rev-parse", "--short=12", "HEAD",
+    }, &code, .ignore) catch return "unknown";
+    return std.mem.trimEnd(u8, output, "\r\n");
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -241,8 +249,16 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addIncludePath(b.path("include"));
     exe_mod.addIncludePath(b.path("src"));
-    exe_mod.addCSourceFile(.{
-        .file = b.path("src/main.c"),
+    const metadata = std.json.parseFromSliceLeaky(
+        struct { serverInfo: struct { version: []const u8 } },
+        b.allocator,
+        @embedFile("src/mcp/initialize.json"),
+        .{ .ignore_unknown_fields = true },
+    ) catch @panic("invalid MCP server metadata");
+    exe_mod.addCMacro("STELOG_VERSION", b.fmt("\"{s}\"", .{metadata.serverInfo.version}));
+    exe_mod.addCMacro("STELOG_BUILD_COMMIT", b.fmt("\"{s}\"", .{buildCommit(b)}));
+    exe_mod.addCSourceFiles(.{
+        .files = &.{ "src/main.c", "src/doctor.c" },
         .flags = c_flags,
     });
     exe_mod.linkLibrary(core_lib);
@@ -326,4 +342,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_tests2.step);
     test_step.dependOn(&run_tests3.step);
+    if (target.query.isNative()) {
+        const cli_test = b.addSystemCommand(&.{"sh"});
+        cli_test.addFileArg(b.path("tests/test_cli.sh"));
+        cli_test.addArtifactArg(exe);
+        test_step.dependOn(&cli_test.step);
+    }
 }

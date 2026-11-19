@@ -58,9 +58,6 @@ static void droid_walk_cb(const char *full_path, const char *filename, uint64_t 
                         sid[0] ? sid : NULL, cwd[0] ? cwd : NULL, size, false, false);
 }
 
-void stelog_droid_discover(const char *droid_home, StelogFileList *out_files) {
-    if (!droid_home || !droid_home[0]) return;
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/sessions", droid_home);
-    stelog_walk_dir(dir, droid_walk_cb, out_files);
+int stelog_droid_discover(const char *dir, StelogFileList *files) {
+    return stelog_walk_dir(dir, droid_walk_cb, files);
 }

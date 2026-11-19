@@ -34,9 +34,6 @@ static void pi_walk_cb(const char *full_path, const char *filename, uint64_t siz
                         sid[0] ? sid : NULL, NULL, size, false, false);
 }
 
-void stelog_pi_discover(const char *pi_home, StelogFileList *out_files) {
-    if (!pi_home || !pi_home[0]) return;
-    char dir[1024];
-    snprintf(dir, sizeof(dir), "%s/sessions", pi_home);
-    stelog_walk_dir(dir, pi_walk_cb, out_files);
+int stelog_pi_discover(const char *dir, StelogFileList *files) {
+    return stelog_walk_dir(dir, pi_walk_cb, files);
 }

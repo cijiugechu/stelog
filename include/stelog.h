@@ -331,6 +331,7 @@ typedef struct {
     StelogCaseMode case_mode;   /* -S (smart, default) / -i (ignore-case) / -s (case-sensitive) */
     bool fixed_strings;         /* -F: literal fixed-string search (no syntax/wildcard parsing) */
     bool regex_mode;            /* -E / -P: PCRE2 JIT regular expression search */
+    bool existence_only;        /* Return total_matches as 0 or 1, without materializing hits. */
 } StelogQuery;
 
 typedef struct {

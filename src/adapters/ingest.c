@@ -90,26 +90,33 @@ uint32_t stelog_filelist_add(StelogFileList *list,
     return id;
 }
 
-void stelog_walk_dir(const char *dir_path, StelogWalkCb cb, void *ctx) {
+int stelog_walk_dir(const char *dir_path, StelogWalkCb cb, void *ctx) {
     DIR *d = opendir(dir_path);
-    if (!d) return;
+    if (!d) return errno;
 
+    int error = 0;
     struct dirent *ent;
     char child[2048];
-    while ((ent = readdir(d)) != NULL) {
+    while (errno = 0, (ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') continue;
         int n = snprintf(child, sizeof(child), "%s/%s", dir_path, ent->d_name);
-        if (n <= 0 || (size_t)n >= sizeof(child)) continue;
-
+        if (n < 0 || (size_t)n >= sizeof(child)) {
+            error = ENAMETOOLONG;
+            continue;
+        }
         struct stat st;
-        if (lstat(child, &st) != 0) continue;
-        if (S_ISDIR(st.st_mode)) {
-            stelog_walk_dir(child, cb, ctx);
+        if (lstat(child, &st) != 0) {
+            if (errno != ENOENT) error = errno;
+        } else if (S_ISDIR(st.st_mode)) {
+            int err = stelog_walk_dir(child, cb, ctx);
+            if (err && err != ENOENT) error = err;
         } else if (S_ISREG(st.st_mode)) {
             cb(child, ent->d_name, (uint64_t)st.st_size, ctx);
         }
     }
+    if (errno) error = errno;
     closedir(d);
+    return error;
 }
 
 /* ============================================================================
@@ -664,13 +671,55 @@ static int cmp_task_desc(const void *a, const void *b) {
     return (ta->chunk_start < tb->chunk_start) ? -1 : 1;
 }
 
-static void resolve_default_path(const char *override, const char *home, const char *rel, char *out, size_t cap) {
-    if (override && override[0]) {
-        snprintf(out, cap, "%s", override);
-    } else if (home && home[0]) {
-        snprintf(out, cap, "%s/%s", home, rel);
-    } else {
-        out[0] = '\0';
+const StelogSourceDir stelog_source_dirs[] = {
+    { STELOG_AGENT_CODEX, "sessions", stelog_codex_discover },
+    { STELOG_AGENT_CODEX, "archived_sessions", stelog_codex_discover_archived },
+    { STELOG_AGENT_AGY, "brain", stelog_agy_discover },
+    { STELOG_AGENT_PI, "sessions", stelog_pi_discover },
+    { STELOG_AGENT_DROID, "sessions", stelog_droid_discover },
+};
+const size_t stelog_source_dir_count = sizeof(stelog_source_dirs) / sizeof(stelog_source_dirs[0]);
+
+static int resolve_agent_home(StelogAgentKind agent, const char *override, char *out, size_t cap) {
+    static const char *const defaults[STELOG_AGENT_COUNT] = {
+        [STELOG_AGENT_CODEX] = ".codex", [STELOG_AGENT_AGY] = ".gemini/antigravity-cli",
+        [STELOG_AGENT_PI] = ".pi/agent", [STELOG_AGENT_DROID] = ".factory",
+    };
+    const char *home = getenv("HOME");
+    int len;
+    if (override && override[0]) len = snprintf(out, cap, "%s", override);
+    else if (home && home[0]) len = snprintf(out, cap, "%s/%s", home, defaults[agent]);
+    else { out[0] = 0; return ENOENT; }
+    return len < 0 || (size_t)len >= cap ? ENAMETOOLONG : 0;
+}
+
+int stelog_source_path(const StelogSourceDir *source, const char *override_home, char *out, size_t cap) {
+    int err = resolve_agent_home(source->agent, override_home, out, cap);
+    if (err) return err;
+    size_t used = strlen(out);
+    int len = snprintf(out + used, cap - used, "/%s", source->subdir);
+    return len < 0 || (size_t)len >= cap - used ? ENAMETOOLONG : 0;
+}
+
+void stelog_discover_files(const char *const homes[], uint32_t mask, StelogFileList *files) {
+    for (size_t i = 0; i < stelog_source_dir_count; ++i) {
+        const StelogSourceDir *source = &stelog_source_dirs[i];
+        char path[1024];
+        if ((mask & (1u << source->agent)) &&
+            stelog_source_path(source, homes[source->agent], path, sizeof(path)) == 0)
+            source->discover(path, files);
+    }
+}
+
+void stelog_load_metadata(const char *const homes[], uint32_t mask, StelogMetaMap *meta) {
+    char dir[1024];
+    if ((mask & (1u << STELOG_AGENT_CODEX)) &&
+        resolve_agent_home(STELOG_AGENT_CODEX, homes[STELOG_AGENT_CODEX], dir, sizeof(dir)) == 0) {
+        stelog_codex_load_metadata(dir, meta);
+    }
+    if ((mask & (1u << STELOG_AGENT_AGY)) &&
+        resolve_agent_home(STELOG_AGENT_AGY, homes[STELOG_AGENT_AGY], dir, sizeof(dir)) == 0) {
+        stelog_agy_load_metadata(dir, meta);
     }
 }
 
@@ -681,29 +730,22 @@ int stelog_run_scan(const StelogScanConfig *cfg,
     memset(out_report, 0, sizeof(*out_report));
 
     double t_start = stelog_now_ms();
-    const char *home = getenv("HOME");
-    char codex_dir[1024], agy_dir[1024], pi_dir[1024], droid_dir[1024];
-    resolve_default_path(cfg->codex_home, home, ".codex", codex_dir, sizeof(codex_dir));
-    resolve_default_path(cfg->agy_home, home, ".gemini/antigravity-cli", agy_dir, sizeof(agy_dir));
-    resolve_default_path(cfg->pi_home, home, ".pi/agent", pi_dir, sizeof(pi_dir));
-    resolve_default_path(cfg->droid_home, home, ".factory", droid_dir, sizeof(droid_dir));
-
+    const char *homes[STELOG_AGENT_COUNT] = {
+        [STELOG_AGENT_CODEX] = cfg->codex_home, [STELOG_AGENT_AGY] = cfg->agy_home,
+        [STELOG_AGENT_PI] = cfg->pi_home, [STELOG_AGENT_DROID] = cfg->droid_home,
+    };
     uint32_t mask = cfg->agent_mask ? cfg->agent_mask : ((1u << STELOG_AGENT_COUNT) - 1u);
 
     /* 1. Discover files */
     StelogFileList files;
     stelog_filelist_init(&files);
-    if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_discover(codex_dir, &files);
-    if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_discover(agy_dir, &files);
-    if (mask & (1u << STELOG_AGENT_PI))    stelog_pi_discover(pi_dir, &files);
-    if (mask & (1u << STELOG_AGENT_DROID)) stelog_droid_discover(droid_dir, &files);
+    stelog_discover_files(homes, mask, &files);
     double t_disc = stelog_now_ms();
 
     /* 2. Load SQLite session metadata */
     StelogMetaMap meta;
     stelog_metamap_init(&meta, 256);
-    if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_load_metadata(codex_dir, &meta);
-    if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_load_metadata(agy_dir, &meta);
+    stelog_load_metadata(homes, mask, &meta);
     double t_meta = stelog_now_ms();
 
     /* 3. Build Intra-file Chunk Task Queue */

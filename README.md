@@ -27,6 +27,9 @@ Requires **Zig 0.16+**.
 # Build native ReleaseFast binary -> ./zig-out/bin/stelog
 zig build -Doptimize=ReleaseFast
 
+# Show the version and build commit (unknown for a source archive without Git metadata)
+./zig-out/bin/stelog --version
+
 # Run all unit & integration tests
 zig build test -Doptimize=ReleaseFast
 

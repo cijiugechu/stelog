@@ -6,6 +6,9 @@ Practical cheatsheet for the `stelog` CLI and MCP Server.
 
 | Goal | Command |
 | :--- | :--- |
+| Check the installed version and build commit | `stelog --version` or `stelog -V` |
+| List commands | `stelog --help` or `stelog help` |
+| See a command's flags and an example | `stelog help digest`, `stelog digest --help`, or `stelog digest -h` |
 | Find which session(s) decided X *(best first step)* | `stelog search "X \| Y" . --group-by session` |
 | Read a session's condensed decision stream | `stelog digest @<id> [--budget 14336] [--offset N]` |
 | Trace how a topic evolved over time | `stelog timeline "X \| Y" .` |
@@ -14,6 +17,8 @@ Practical cheatsheet for the `stelog` CLI and MCP Server.
 | Expand surrounding turns around a `doc_id` | `stelog context <doc_id> -w 5` |
 | Read full message or raw JSONL line on disk | `stelog show <doc_id> [--raw] [--tail]` |
 | List recent sessions for the current repo | `stelog sessions . --since 7d` |
+| Check for a match in a shell script | `stelog search -q "migration" .` |
+| Diagnose missing history or index problems | `stelog doctor` |
 | Count matches or break down by session/agent/role | `stelog search "X" -c` / `--count-by session` |
 | Find earliest / latest mention | `stelog search "X" --first 1` / `--last 1` |
 
@@ -83,6 +88,7 @@ Common flags for `search` / `timeline`:
 | `-C <N>` / `-B <N>` / `-A <N>` | Show N dialogue turns before/after each hit |
 | `--group-by session` | Group hits by session with title, hit count & best snippet |
 | `--count-by <axis>` | Histogram by `agent`, `role`, `project`, `actor`, or `session` |
+| `-q, --quiet` | Test for any match within the filters. Exit 0 for a match, 1 for none, or 2 on error. Only errors print to stderr. Pagination and output modes do not affect the test. |
 | `-c, --count` / `-l, --sessions-only` | Print total match count only / unique session IDs only |
 | `--sort <relevance\|oldest\|newest>` | Sort order (`--first N`, `--last N`, `--max-count N\|-N`) |
 | `--no-dedup` | Keep exact duplicate copies across forked/retried transcripts |
@@ -90,6 +96,8 @@ Common flags for `search` / `timeline`:
 | `--json` / `--no-color` / `--no-sync` | JSON output / disable ANSI colors / skip auto Hot Delta sync |
 
 ## Index Management & Diagnostics
+
+`stelog doctor` reports the transcript directories, the number of recognized files in each, and whether the index can be opened. It only reads local files. A directory for an unused agent may be missing. A missing or invalid index, an inaccessible source, or an unset `HOME` gives exit code 1. Use `--json` for machine-readable results and `--index-dir DIR` to inspect a specific index.
 
 Every CLI query automatically checks for newly appended transcript bytes and updates the Hot Delta segment in ~1–2 ms (pass `--no-sync` to skip).
 

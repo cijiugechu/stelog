@@ -56,17 +56,14 @@ static void codex_walk_cb(const char *full_path, const char *filename, uint64_t 
                         sid[0] ? sid : NULL, NULL, size, is_zst, ctx->is_archived);
 }
 
-void stelog_codex_discover(const char *codex_home, StelogFileList *out_files) {
-    if (!codex_home || !codex_home[0]) return;
-    char dir[1024];
+int stelog_codex_discover(const char *dir, StelogFileList *files) {
+    CodexWalkCtx ctx = { files, false };
+    return stelog_walk_dir(dir, codex_walk_cb, &ctx);
+}
 
-    snprintf(dir, sizeof(dir), "%s/sessions", codex_home);
-    CodexWalkCtx ctx = { out_files, false };
-    stelog_walk_dir(dir, codex_walk_cb, &ctx);
-
-    snprintf(dir, sizeof(dir), "%s/archived_sessions", codex_home);
-    ctx.is_archived = true;
-    stelog_walk_dir(dir, codex_walk_cb, &ctx);
+int stelog_codex_discover_archived(const char *dir, StelogFileList *files) {
+    CodexWalkCtx ctx = { files, true };
+    return stelog_walk_dir(dir, codex_walk_cb, &ctx);
 }
 
 void stelog_codex_load_metadata(const char *codex_home, StelogMetaMap *out_meta) {

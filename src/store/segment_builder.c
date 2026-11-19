@@ -1562,12 +1562,6 @@ static int cmp_build_task_desc(const void *a, const void *b) {
     return 0;
 }
 
-static void resolve_agent_home(const char *override, const char *home, const char *rel, char *out, size_t cap) {
-    if (override && override[0]) snprintf(out, cap, "%s", override);
-    else if (home && home[0]) snprintf(out, cap, "%s/%s", home, rel);
-    else out[0] = '\0';
-}
-
 /* ============================================================================
  * Public Entry: stelog_index_sync (Base + Hot Delta + Incremental Manifest)
  * ============================================================================ */
@@ -1604,20 +1598,15 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     }
 
     /* 1. Discover current source files on disk */
-    const char *home = getenv("HOME");
-    char codex_dir[1024], agy_dir[1024], pi_dir[1024], droid_dir[1024];
-    resolve_agent_home(cfg->codex_home, home, ".codex", codex_dir, sizeof(codex_dir));
-    resolve_agent_home(cfg->agy_home, home, ".gemini/antigravity-cli", agy_dir, sizeof(agy_dir));
-    resolve_agent_home(cfg->pi_home, home, ".pi/agent", pi_dir, sizeof(pi_dir));
-    resolve_agent_home(cfg->droid_home, home, ".factory", droid_dir, sizeof(droid_dir));
+    const char *homes[STELOG_AGENT_COUNT] = {
+        [STELOG_AGENT_CODEX] = cfg->codex_home, [STELOG_AGENT_AGY] = cfg->agy_home,
+        [STELOG_AGENT_PI] = cfg->pi_home, [STELOG_AGENT_DROID] = cfg->droid_home,
+    };
     uint32_t mask = cfg->agent_mask ? cfg->agent_mask : ((1u << STELOG_AGENT_COUNT) - 1u);
 
     StelogFileList discovered;
     stelog_filelist_init(&discovered);
-    if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_discover(codex_dir, &discovered);
-    if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_discover(agy_dir, &discovered);
-    if (mask & (1u << STELOG_AGENT_PI))    stelog_pi_discover(pi_dir, &discovered);
-    if (mask & (1u << STELOG_AGENT_DROID)) stelog_droid_discover(droid_dir, &discovered);
+    stelog_discover_files(homes, mask, &discovered);
     double t_disc = stelog_now_ms();
 
     /* 2. Load existing current.meta + manifest.bin (unless force_rebuild) */
@@ -1795,8 +1784,7 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     StelogMetaMap meta;
     stelog_metamap_init(&meta, 256);
     if (files_changed > 0) {
-        if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_load_metadata(codex_dir, &meta);
-        if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_load_metadata(agy_dir, &meta);
+        stelog_load_metadata(homes, mask, &meta);
     }
 
     if (task_count > 1) qsort(tasks, task_count, sizeof(BuildChunkTask), cmp_build_task_desc);

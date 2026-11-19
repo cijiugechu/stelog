@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "stelog.h"
+#include "doctor.h"
 #include "base/simd.h"
 #include "base/time_iso8601.h"
 #include "json/json_writer.h"
@@ -47,60 +48,11 @@ static const char *role_color(StelogRoleKind r) {
     }
 }
 
-static void print_usage(void) {
-    printf("stelog 0.2.0 - Fast DOD coding-agent history search, decision archaeology & MCP server\n\n"
-           "Usage:\n"
-           "  stelog search <query> [TARGET] [flags]   Search decisions (`A | B`, `-term`, `prefix*`, inline `agent:`)\n"
-           "  stelog digest @<session> [--budget N] [--offset T]  Condensed user<->assistant decision stream of a session\n"
-           "  stelog timeline <query> [TARGET] [flags] Chronological (oldest-first) decision timeline\n"
-           "  stelog files [file_substr] [TARGET]      Find who edited/created a file and when\n"
-           "  stelog context <doc_id> [-w N] [--json]  Show surrounding dialogue turns (collapses tools by default)\n"
-           "  stelog show <doc_id> [--raw] [--tail]    Show full document or raw JSONL line\n"
-           "  stelog sessions|list [TARGET] [flags]    List sessions with auto-extracted titles\n"
-           "  stelog mcp [--index-dir DIR]             Run stdio JSON-RPC 2.0 MCP Server\n"
-           "  stelog index [--rebuild|--compact]       Build or incrementally refresh DOD index\n"
-           "  stelog stats [--json]                    Show Base/Delta index stats\n"
-           "  stelog bench [--iters N]                 5-suite query latency & zero-malloc regression benchmark\n"
-           "  stelog scan [opts]                       Phase 1 raw parallel ingest benchmark\n\n"
-           "Query Syntax (ripgrep-inspired):\n"
-           "  A | B / A OR B      Bilingual or alternative OR branches\n"
-           "  -term / -\"phrase\"   Exclude documents matching term or exact phrase\n"
-           "  prefix*             Word-start prefix wildcard (SIMD contiguous text.bin scan)\n"
-           "  agent:agy role:user Inline filters: agent:, role:, -role:, project:, actor:, session:, since:, until:, @sid8\n\n"
-           "Positional TARGET shortcuts (inspired by csift):\n"
-           "  .                   Scope to current working directory\n"
-           "  @<session-prefix>   Scope to session(s) matching UUID prefix\n"
-           "  /<path>             Scope to project path substring\n\n"
-           "Filters & Output Modes:\n"
-           "  -S, --smart-case          Smart case (default: case-sensitive if query has uppercase)\n"
-           "  -i, --ignore-case         Force case-insensitive search\n"
-           "  -s, --case-sensitive      Force case-sensitive search\n"
-           "  -F, --fixed-strings       Literal substring search (disables syntax/wildcard parsing)\n"
-           "  -E, --regex, -P           PCRE2 JIT regex search (auto literal/SwissTable prefilter)\n"
-           "  -C <N> / -B <N> / -A <N>  Show N surrounding dialogue turns around each search hit\n"
-           "  --agent <csv>             codex, agy, pi, droid (repeatable)\n"
-           "  -t, --role <csv>          user, assistant, inter_agent, tool_call, tool_result, thinking, system\n"
-           "  -T, --exclude-role <csv>  Exclude specified roles\n"
-           "  --project <substr>        Match project/cwd substring\n"
-           "  --actor <substr>          Match actor/model substring\n"
-           "  --no-subagents            Exclude subagent transcripts\n"
-           "  --since <ISO8601|Nd|Nh>   Start time (e.g. 7d, 24h, 2026-11-01T00:00:00Z)\n"
-           "  --until <ISO8601>         End time\n"
-           "  --sort <relevance|oldest|newest>\n"
-           "  --first <N> / --last <N> / --max-count <N|-N>\n"
-           "  -c, --count               Print total match count only\n"
-           "  -l, --sessions-only       Print unique matching session IDs (one per line)\n"
-           "  --count-by <axis>         Histogram by: agent, role, project, actor, session\n"
-           "  --group-by session        Group hits by session with date, title & best snippet\n"
-           "  --no-dedup                Keep exact duplicate copies across forks/retries\n"
-           "  --include-tools           Include tool_result records\n"
-           "  --include-thinking        Include thinking/reasoning summaries\n"
-           "  --limit <N> --offset <N>  Pagination\n"
-           "  --json                    Structured JSON output\n"
-           "  --no-sync                 Skip automatic pre-query Hot Delta refresh\n"
-           "  --no-color                Disable ANSI colors\n"
-           "  --index-dir <DIR>         Override index directory\n");
+static bool is_help_flag(const char *arg) {
+    return strcmp(arg, "-h") == 0 || strcmp(arg, "--help") == 0;
 }
+
+static int print_command_help(const char *name);
 
 static void fmt_ts(int64_t ts_ms, char *out, size_t cap) {
     if (ts_ms <= 0) { snprintf(out, cap, "unknown-time"); return; }
@@ -310,12 +262,12 @@ static void write_hit_json(StelogJsonWriter *w, const StelogHit *h) {
     stelog_jw_obj_end(w);
 }
 
-static StelogIndex *open_with_optional_sync(const char *index_dir, bool no_sync) {
+static StelogIndex *open_with_optional_sync(const char *index_dir, bool no_sync, bool require_sync) {
     if (!no_sync) {
         StelogIndexConfig cfg;
         memset(&cfg, 0, sizeof(cfg));
         cfg.index_dir = index_dir;
-        stelog_index_sync(&cfg, NULL);
+        if (stelog_index_sync(&cfg, NULL) != 0 && require_sync) return NULL;
     }
     return stelog_index_open(index_dir);
 }
@@ -328,6 +280,7 @@ static int cmd_scan(int argc, char **argv) {
     StelogScanConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) cfg.agent_mask |= parse_agent_csv(argv[++i]);
         else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) cfg.threads = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--chunk-mb") == 0 && i + 1 < argc) cfg.chunk_bytes = (uint32_t)strtoul(argv[++i], NULL, 10) * 1024u * 1024u;
@@ -358,6 +311,7 @@ static int cmd_index(int argc, char **argv) {
     memset(&cfg, 0, sizeof(cfg));
     bool json_out = false;
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--rebuild") == 0) cfg.force_rebuild = true;
         else if (strcmp(argv[i], "--compact") == 0) cfg.force_compact = true;
         else if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) cfg.index_dir = argv[++i];
@@ -413,10 +367,12 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
 
     const char *index_dir = NULL;
     bool no_sync = false, json_out = false, count_only = false, end_of_opts = false;
+    const char *unknown_option = NULL;
     uint32_t ctx_before = 0, ctx_after = 0;
     char cwd_buf[1024];
 
     for (int i = 2; i < argc; ++i) {
+        if (!end_of_opts && is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (!end_of_opts && strcmp(argv[i], "--") == 0) { end_of_opts = true; continue; }
         if (!end_of_opts && strcmp(argv[i], "--agent") == 0 && i + 1 < argc) q.agent_mask |= parse_agent_csv(argv[++i]);
         else if (!end_of_opts && (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--role") == 0) && i + 1 < argc) q.role_mask |= parse_role_csv(argv[++i]);
@@ -462,6 +418,7 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
             const char *gb = argv[++i];
             if (strcmp(gb, "session") == 0) q.group_by_session = true;
         } else if (!end_of_opts && strcmp(argv[i], "--no-dedup") == 0) q.no_dedup = true;
+        else if (!end_of_opts && (strcmp(argv[i], "-q") == 0 || strcmp(argv[i], "--quiet") == 0)) q.existence_only = true;
         else if (!end_of_opts && (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--count") == 0)) count_only = true;
         else if (!end_of_opts && (strcmp(argv[i], "-l") == 0 || strcmp(argv[i], "--sessions-only") == 0)) q.sessions_only = true;
         else if (!end_of_opts && strcmp(argv[i], "--no-subagents") == 0) q.no_subagents = true;
@@ -474,24 +431,36 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
         else if (end_of_opts || argv[i][0] != '-') {
             if (!q.query) q.query = argv[i];
             else apply_target_arg(argv[i], cwd_buf, sizeof(cwd_buf), &q.project_substr, &q.session_id);
+        } else {
+            unknown_option = argv[i];
         }
     }
 
-    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync);
+    if (q.existence_only && unknown_option) {
+        fprintf(stderr, "stelog: unknown option or missing argument: %s\n", unknown_option);
+        return 2;
+    }
+    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync, q.existence_only);
     if (!idx) {
-        fprintf(stderr, "Failed to open index. Run `stelog index` first.\n");
-        return 1;
+        fprintf(stderr, "Failed to open index or refresh it. Run `stelog doctor` to check its location.\n");
+        return q.existence_only ? 2 : 1;
     }
 
     StelogSearchResult sr;
     if (stelog_index_search(idx, &q, &sr) != 0) {
         if (sr.error_msg.len > 0) {
             fprintf(stderr, "stelog: %.*s\n", (int)sr.error_msg.len, sr.error_msg.ptr);
+        } else {
+            fputs("stelog: search failed\n", stderr);
         }
         stelog_index_close(idx);
-        return 1;
+        return q.existence_only ? 2 : 1;
     }
 
+    if (q.existence_only) {
+        stelog_index_close(idx);
+        return sr.total_matches ? 0 : 1;
+    }
     if (count_only) {
         printf("%u\n", sr.total_matches);
         stelog_index_close(idx);
@@ -720,6 +689,7 @@ static int cmd_files(int argc, char **argv) {
     char cwd_buf[1024];
 
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) agent_mask |= parse_agent_csv(argv[++i]);
         else if (strcmp(argv[i], "--project") == 0 && i + 1 < argc) proj = argv[++i];
         else if (strcmp(argv[i], "--session") == 0 && i + 1 < argc) sess = argv[++i];
@@ -739,7 +709,7 @@ static int cmd_files(int argc, char **argv) {
         }
     }
 
-    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync);
+    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync, false);
     if (!idx) return 1;
     StelogFileHistoryResult fh;
     stelog_index_files(idx, file_substr, agent_mask, proj, sess, since, until, no_subagents, limit, offset, &fh);
@@ -800,6 +770,7 @@ static int cmd_context(int argc, char **argv) {
     const char *index_dir = NULL;
     bool json_out = false, include_tools = false;
     for (int i = 3; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if ((strcmp(argv[i], "-w") == 0 || strcmp(argv[i], "--window") == 0) && i + 1 < argc)
             window = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
@@ -864,6 +835,7 @@ static int cmd_digest(int argc, char **argv) {
     uint32_t budget = 14336, turn_offset = 0;
     bool include_tools = false, no_sync = false, json_out = false;
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) budget = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) turn_offset = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--include-tools") == 0) include_tools = true;
@@ -874,7 +846,7 @@ static int cmd_digest(int argc, char **argv) {
         else if (argv[i][0] != '-' && !sess) sess = argv[i];
     }
     if (!sess) { fprintf(stderr, "Missing session id or @prefix.\n"); return 1; }
-    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync);
+    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync, false);
     if (!idx) return 1;
     StelogDigestOptions dopts;
     memset(&dopts, 0, sizeof(dopts));
@@ -989,6 +961,7 @@ static int cmd_show(int argc, char **argv) {
     uint32_t off = 0, limit = 32768;
     const char *index_dir = NULL;
     for (int i = 3; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--raw") == 0) raw = true;
         else if (strcmp(argv[i], "--tail") == 0) tail = true;
         else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) off = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -1052,6 +1025,7 @@ static int cmd_sessions(int argc, char **argv) {
     bool no_sync = false, json_out = false;
     char cwd_buf[1024];
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) agent_mask |= parse_agent_csv(argv[++i]);
         else if (strcmp(argv[i], "--project") == 0 && i + 1 < argc) proj = argv[++i];
         else if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) since = parse_time_arg_or_exit("--since", argv[++i], false);
@@ -1064,7 +1038,7 @@ static int cmd_sessions(int argc, char **argv) {
         else if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
         else if (argv[i][0] != '-') apply_target_arg(argv[i], cwd_buf, sizeof(cwd_buf), &proj, &sess);
     }
-    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync);
+    StelogIndex *idx = open_with_optional_sync(index_dir, no_sync, false);
     if (!idx) return 1;
     StelogSessionListResult sl;
     stelog_index_list_sessions(idx, agent_mask, proj, since, until, limit, offset, &sl);
@@ -1115,10 +1089,26 @@ static int cmd_sessions(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_doctor(int argc, char **argv) {
+    const char *index_dir = NULL;
+    bool json = false;
+    for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
+        if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
+        else if (strcmp(argv[i], "--json") == 0) json = true;
+        else {
+            fputs("Usage: stelog doctor [--index-dir DIR] [--json]\n", stderr);
+            return 2;
+        }
+    }
+    return stelog_doctor(index_dir, json);
+}
+
 static int cmd_stats(int argc, char **argv) {
     const char *index_dir = NULL;
     bool json_out = false;
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
         else if (strcmp(argv[i], "--json") == 0) json_out = true;
     }
@@ -1210,6 +1200,7 @@ static int cmd_bench(int argc, char **argv) {
     uint32_t iters = 200;
     const char *index_dir = NULL;
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
     }
@@ -1329,30 +1320,188 @@ static int cmd_bench(int argc, char **argv) {
 static int cmd_mcp(int argc, char **argv) {
     const char *index_dir = NULL;
     for (int i = 2; i < argc; ++i) {
+        if (is_help_flag(argv[i])) return print_command_help(argv[1]);
         if (strcmp(argv[i], "--index-dir") == 0 && i + 1 < argc) index_dir = argv[++i];
     }
     return stelog_mcp_serve(index_dir);
 }
 
-int main(int argc, char **argv) {
-    init_color(argc, argv);
-    if (argc < 2 || strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
+#define BUILD_VERSION "stelog " STELOG_VERSION " (" STELOG_BUILD_COMMIT ")"
+#define INDEX_DIR_OPT "  --index-dir DIR          Use a different index directory\n"
+#define JSON_OPT      "  --json                   Write structured JSON\n"
+#define NO_SYNC_OPT   "  --no-sync                Skip the pre-query index refresh\n"
+#define NO_COLOR_OPT  "  --no-color               Disable ANSI colors\n"
+#define AGENT_OPT     "  --agent CSV              Filter by agent (codex, agy, pi, droid)\n"
+#define PROJECT_OPT   "  --project TEXT           Match a project path substring\n"
+#define TIME_OPTS     "  --since TIME, --until TIME  Filter by time (e.g. 7d, yesterday, YYYY-MM-DD, ISO 8601)\n"
+#define PAGE_OPTS     "  --limit N, --offset N    Limit results or skip the first N\n"
+#define READ_OPTS     NO_SYNC_OPT INDEX_DIR_OPT JSON_OPT NO_COLOR_OPT
+
+static const char query_options[] =
+    "  TARGET                   Current directory (.), /project/path, or @session-prefix\n"
+    "  --                       End options (e.g. stelog search -F -- --help)\n"
+    "  -S, --smart-case         Uppercase in a query makes the search case-sensitive (default)\n"
+    "  -i, --ignore-case        Ignore case\n"
+    "  -s, --case-sensitive     Match case exactly\n"
+    "  -F, --fixed-strings      Match the query literally\n"
+    "  -E, -P, --regex          Use a PCRE2 regular expression\n"
+    "  -C, --context N          Show N dialogue turns before and after each hit\n"
+    "  -B N, -A N               Show N turns before or after each hit, respectively\n"
+    AGENT_OPT PROJECT_OPT
+    "  -t, --role CSV           Include roles (user, assistant, inter_agent, tool_call,\n"
+    "                           tool_result, thinking, system)\n"
+    "  -T, --exclude-role CSV   Exclude roles\n"
+    "  --actor TEXT             Match an actor or model substring\n"
+    "  --session ID             Filter by session\n"
+    "  --no-subagents           Exclude subagent transcripts\n"
+    "  --include-tools          Include tool results\n"
+    "  --include-thinking       Include reasoning records\n"
+    TIME_OPTS
+    "  --sort ORDER             relevance, oldest, or newest\n"
+    "  --first N, --last N      Return the oldest or newest N matches\n"
+    "  --max-count N            Positive N selects oldest matches, negative N selects newest\n"
+    "  -q, --quiet              No results printed. Exit 0 for a match, 1 for none, 2 for an error\n"
+    "  -c, --count              Print the total match count\n"
+    "  -l, --sessions-only      Print matching session IDs, one per line\n"
+    "  --count-by AXIS          Count by agent, role, project, actor, or session\n"
+    "  --group-by session       Group hits by session\n"
+    "  --no-dedup               Keep duplicate records\n"
+    PAGE_OPTS READ_OPTS
+    "\nQuery syntax:\n"
+    "  A | B or A OR B          Match either branch\n"
+    "  -term or -\"phrase\"       Exclude a term or exact phrase\n"
+    "  prefix*                  Match a word prefix\n"
+    "  agent:agy role:user      Inline filters also accept -role:, project:, actor:, session:,\n"
+    "                           since:, until:, and @session-prefix\n";
+
+static int cmd_search(int argc, char **argv) { return cmd_search_or_timeline(argc, argv, false); }
+static int cmd_timeline(int argc, char **argv) { return cmd_search_or_timeline(argc, argv, true); }
+static int cmd_help(int argc, char **argv);
+
+typedef struct {
+    const char *name;
+    const char *args;
+    const char *description;
+    const char *options;
+    const char *example;
+    int (*run)(int argc, char **argv);
+} Command;
+
+static const Command commands[] = {
+    {"search", "<query> [TARGET] [flags]", "Search coding-agent history by relevance.",
+     query_options, "search \"mirror | registry\" . --group-by session", cmd_search},
+    {"timeline", "<query> [TARGET] [flags]", "Show matching decisions in chronological order.",
+     query_options, "timeline \"migration\" . --since 7d", cmd_timeline},
+    {"digest", "@<session-prefix> [flags]", "Read a condensed transcript of a session.",
+     "  --budget N               Set the text budget in bytes (default 14336)\n"
+     "  --offset TURN            Skip this many turns\n"
+     "  --include-tools          Include tool activity\n" READ_OPTS,
+     "digest @30c3cab1 --budget 4096", cmd_digest},
+    {"files", "[file_substr] [TARGET] [flags]", "Find which sessions edited a file and when.",
+     "  TARGET                   Current directory (.), /project/path, or @session-prefix\n"
+     AGENT_OPT PROJECT_OPT
+     "  --session ID             Filter by session\n"
+     "  --no-subagents           Exclude subagent transcripts\n"
+     TIME_OPTS PAGE_OPTS READ_OPTS, "files roaring.c .", cmd_files},
+    {"context", "<doc_id> [flags]", "Read dialogue turns around a document.",
+     "  -w, --window N           Show N turns on each side (default 5)\n"
+     "  --include-tools          Include tool activity\n" INDEX_DIR_OPT JSON_OPT NO_COLOR_OPT,
+     "context 12345 -w 2", cmd_context},
+    {"show", "<doc_id> [flags]", "Read a document or its original JSONL record.",
+     "  --raw                    Read the source JSONL record\n"
+     "  --tail                   Read the end of the record\n"
+     "  --offset N               Start at byte offset N\n"
+     "  --limit N                Return up to N bytes (default 32768)\n" INDEX_DIR_OPT JSON_OPT,
+     "show 12345 --raw --tail --limit 1024", cmd_show},
+    {"sessions", "[TARGET] [flags]", "List recent sessions and their titles (alias: list).",
+     "  TARGET                   Current directory (.) or /project/path\n"
+     AGENT_OPT PROJECT_OPT TIME_OPTS PAGE_OPTS READ_OPTS,
+     "sessions . --since 7d", cmd_sessions},
+    {"index", "[flags]", "Build or incrementally refresh the index.",
+     "  --rebuild                Rebuild the index from source transcripts\n"
+     "  --compact                Merge the base and delta segments\n"
+     "  --threads N              Set the worker count\n"
+     "  --include-tools          Index tool results\n"
+     "  --include-thinking       Index reasoning records\n" INDEX_DIR_OPT JSON_OPT,
+     "index --compact", cmd_index},
+    {"doctor", "[flags]", "Check transcript directories and the index without syncing.",
+     INDEX_DIR_OPT JSON_OPT, "doctor --json", cmd_doctor},
+    {"stats", "[flags]", "Show index sizes and document counts.",
+     INDEX_DIR_OPT JSON_OPT, "stats --json", cmd_stats},
+    {"bench", "[flags]", "Benchmark query latency and allocations.",
+     "  --iters N                Set the iteration count (default 200, minimum 20)\n" INDEX_DIR_OPT,
+     "bench --iters 300", cmd_bench},
+    {"scan", "[flags]", "Measure raw transcript ingestion throughput.",
+     AGENT_OPT
+     "  --threads N              Set the worker count\n"
+     "  --chunk-mb N             Set the read chunk size in MiB\n"
+     "  --include-tools          Include tool results\n"
+     "  --include-thinking       Include reasoning records\n"
+     "  --include-system         Include system messages\n",
+     "scan --agent codex --threads 4", cmd_scan},
+    {"mcp", "[flags]", "Run the JSON-RPC MCP server over stdio.",
+     INDEX_DIR_OPT, "mcp --index-dir ./index", cmd_mcp},
+    {"help", "[command]", "Show general help or help for one command.",
+     "", "help search", cmd_help},
+};
+
+static const Command *find_command(const char *name) {
+    if (strcmp(name, "list") == 0) name = "sessions";
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        if (strcmp(name, commands[i].name) == 0) return &commands[i];
+    }
+    return NULL;
+}
+
+static int unknown_command(const char *name) {
+    fprintf(stderr, "Unknown command '%s'. Run `stelog --help`.\n", name);
+    return 1;
+}
+
+static int print_command_help(const char *name) {
+    const Command *cmd = find_command(name);
+    if (!cmd) return unknown_command(name);
+    printf("Usage: stelog %s %s\n\n%s\n\nOptions:\n"
+           "  -h, --help               Show this help\n%s\nExample:\n  stelog %s\n",
+           name, cmd->args, cmd->description, cmd->options, cmd->example);
+    return 0;
+}
+
+static void print_usage(void) {
+    puts(BUILD_VERSION " - Local coding-agent history search and MCP server\n\n"
+         "Usage: stelog <command> [arguments]\n\nCommands:");
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        printf("  %-12s %s\n", commands[i].name, commands[i].description);
+    }
+    puts("\n  -h, --help      Show this help\n"
+         "  -V, --version   Print the version and build commit\n\n"
+         "Run 'stelog help <command>' or 'stelog <command> --help' for options and examples.");
+}
+
+static int cmd_help(int argc, char **argv) {
+    if (argc == 2) {
         print_usage();
         return 0;
     }
-    if (strcmp(argv[1], "scan") == 0)     return cmd_scan(argc, argv);
-    if (strcmp(argv[1], "index") == 0)    return cmd_index(argc, argv);
-    if (strcmp(argv[1], "search") == 0)   return cmd_search_or_timeline(argc, argv, false);
-    if (strcmp(argv[1], "digest") == 0)   return cmd_digest(argc, argv);
-    if (strcmp(argv[1], "timeline") == 0) return cmd_search_or_timeline(argc, argv, true);
-    if (strcmp(argv[1], "files") == 0)    return cmd_files(argc, argv);
-    if (strcmp(argv[1], "context") == 0)  return cmd_context(argc, argv);
-    if (strcmp(argv[1], "show") == 0)     return cmd_show(argc, argv);
-    if (strcmp(argv[1], "sessions") == 0 || strcmp(argv[1], "list") == 0) return cmd_sessions(argc, argv);
-    if (strcmp(argv[1], "stats") == 0)    return cmd_stats(argc, argv);
-    if (strcmp(argv[1], "bench") == 0)    return cmd_bench(argc, argv);
-    if (strcmp(argv[1], "mcp") == 0)      return cmd_mcp(argc, argv);
+    if (argc != 3) {
+        fputs("Usage: stelog help [command]\n", stderr);
+        return 1;
+    }
+    return print_command_help(argv[2]);
+}
 
-    fprintf(stderr, "Unknown command '%s'. Run `stelog --help`.\n", argv[1]);
-    return 1;
+int main(int argc, char **argv) {
+    if (argc < 2 || is_help_flag(argv[1])) {
+        print_usage();
+        return 0;
+    }
+    if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0) {
+        puts(BUILD_VERSION);
+        return 0;
+    }
+    const Command *cmd = find_command(argv[1]);
+    if (!cmd) return unknown_command(argv[1]);
+    if (argc > 2 && is_help_flag(argv[2])) return print_command_help(argv[1]);
+    init_color(argc, argv);
+    return cmd->run(argc, argv);
 }
