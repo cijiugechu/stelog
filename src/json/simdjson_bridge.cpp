@@ -80,10 +80,119 @@ static inline bool starts_with(std::string_view sv, std::string_view prefix) {
     return sv.size() >= prefix.size() && sv.substr(0, prefix.size()) == prefix;
 }
 
+/* Appends at most `cap` bytes of sv without splitting a UTF-8 sequence. */
+static void append_utf8_capped(std::string &dst, std::string_view sv, size_t cap) {
+    size_t n = sv.size() < cap ? sv.size() : cap;
+    while (n > 0 && n < sv.size() && (static_cast<unsigned char>(sv[n]) & 0xC0u) == 0x80u) n--;
+    dst.append(sv.data(), n);
+}
+
+static bool is_path_arg_key(std::string_view k) {
+    return k == "Path" || k == "path" || k == "TargetFile" || k == "file_path" || k == "filePath" ||
+           k == "FilePath" || k == "AbsolutePath" || k == "absolute_path" || k == "target_file" ||
+           k == "notebook_path";
+}
+
+/* AGY double-encodes string args ("\"/abs/path\""); strip one layer of quotes. */
+static std::string_view strip_wrapping_quotes(std::string_view s) {
+    if (s.size() >= 2 && s.front() == '"' && s.back() == '"') return s.substr(1, s.size() - 2);
+    return s;
+}
+
+/*
+ * Collects "*** Update/Add/Delete File: <path>" markers from an apply_patch body, whether newlines are
+ * real or JSON/JS-escaped ("\n"), into a compact "*** Begin Patch\n*** Update File: a\n..." header.
+ */
+static void collect_patch_file_header(std::string_view in, std::string &header) {
+    header.clear();
+    static constexpr std::string_view kMarkers[] = { "*** Update File: ", "*** Add File: ", "*** Delete File: " };
+    size_t files = 0;
+    size_t pos = 0;
+    while (files < 16) {
+        size_t best = std::string_view::npos;
+        size_t best_m = 0;
+        for (size_t m = 0; m < 3; ++m) {
+            size_t at = in.find(kMarkers[m], pos);
+            if (at < best) { best = at; best_m = m; }
+        }
+        if (best == std::string_view::npos) break;
+        size_t ps = best + kMarkers[best_m].size();
+        size_t pe = ps;
+        while (pe < in.size() && in[pe] != '\n' && in[pe] != '\r' && in[pe] != '\\' && in[pe] != '"') pe++;
+        if (pe > ps) {
+            if (header.empty()) header.assign("*** Begin Patch\n");
+            header.append(kMarkers[best_m]);
+            header.append(in.data() + ps, pe - ps);
+            header.push_back('\n');
+            files++;
+        }
+        pos = pe;
+    }
+}
+
+/*
+ * Appends tool arguments so that file-path keys come first and survive later truncation, the rest is
+ * capped at `cap` bytes, and no cut splits a UTF-8 sequence. Non-object args are appended raw (capped).
+ */
+static void append_tool_args(std::string &dst, ondemand::value &v, size_t cap) {
+    ondemand::json_type jt;
+    if (v.type().get(jt) != SUCCESS) return;
+    if (jt != ondemand::json_type::object) {
+        std::string_view raw;
+        if (v.raw_json().get(raw) == SUCCESS) append_utf8_capped(dst, trim_ws(raw), cap);
+        return;
+    }
+    ondemand::object obj;
+    if (v.get_object().get(obj) != SUCCESS) return;
+    std::string paths;
+    std::string rest;
+    std::string patch_header;
+    for (auto f : obj) {
+        std::string_view key;
+        if (f.unescaped_key().get(key) != SUCCESS) continue;
+        std::string key_s(key);
+        ondemand::value fv;
+        if (f.value().get(fv) != SUCCESS) continue;
+        ondemand::json_type ft;
+        if (fv.type().get(ft) != SUCCESS) continue;
+        if (ft == ondemand::json_type::string && is_path_arg_key(key_s)) {
+            std::string_view s;
+            if (fv.get_string().get(s) == SUCCESS) {
+                s = strip_wrapping_quotes(trim_ws(s));
+                if (!s.empty() && paths.size() < 1024) {
+                    paths.append("\"").append(key_s).append("\":\"");
+                    paths.append(s.data(), s.size());
+                    paths.append("\", ");
+                }
+            }
+            continue;
+        }
+        std::string_view raw;
+        if (fv.raw_json().get(raw) != SUCCESS) continue;
+        if (patch_header.empty() && ft == ondemand::json_type::string &&
+            raw.find("*** Begin Patch") != std::string_view::npos) {
+            collect_patch_file_header(raw, patch_header);
+        }
+        if (rest.size() >= cap) continue;
+        rest.append("\"").append(key_s).append("\":");
+        append_utf8_capped(rest, trim_ws(raw), cap - (rest.size() < cap ? rest.size() : cap));
+        rest.append(", ");
+    }
+    if (rest.size() >= 2 && rest.compare(rest.size() - 2, 2, ", ") == 0) rest.resize(rest.size() - 2);
+    if (paths.size() >= 2 && rest.empty()) paths.resize(paths.size() - 2);
+    dst.append(patch_header);
+    dst.push_back('{');
+    dst.append(paths);
+    append_utf8_capped(dst, rest, cap);
+    dst.push_back('}');
+}
+
+
 /*
  * Detect Codex harness-injected "user" messages that are NOT actually typed by the human
  * (inspired by csift Law 1): AGENTS.md injections, environment_context, permissions,
- * collaboration_mode, turn_aborted, and code-mode `[N] tool exec result:` callbacks.
+ * collaboration_mode, turn_aborted, codex_internal_context / external_codex_apps payloads,
+ * and code-mode `[N] tool exec result:` callbacks.
  */
 static bool is_codex_injected_user_message(std::string_view sv) {
     sv = trim_ws(sv);
@@ -95,6 +204,8 @@ static bool is_codex_injected_user_message(std::string_view sv) {
         starts_with(sv, "<collaboration_mode>") ||
         starts_with(sv, "<turn_aborted>") ||
         starts_with(sv, "<subagent_notification>") ||
+        starts_with(sv, "<codex_internal_context") ||
+        starts_with(sv, "<external_codex_apps") ||
         starts_with(sv, "The following is a <SYSTEM_MESSAGE>")) {
         return true;
     }
@@ -145,6 +256,7 @@ static void emit_event(StelogLineResult *out,
     ev->tag = stelog_tag_pack(agent, role, (uint8_t)(flags | ctx->session_flags));
     ev->session_id = ctx->session_id;
     ev->project = ctx->cwd;
+    ev->title = ctx->title;
     ev->actor = actor_override.len > 0 ? actor_override : ctx->actor;
     ev->msg_id = msg_id;
     ev->parent_id = parent_id.len > 0 ? parent_id : ctx->parent_session_id;
@@ -368,15 +480,29 @@ extern "C" int stelog_json_parse_codex_line(StelogJsonParser *p,
                                arena_copy_sv(arena, actor_str), msg_id,
                                { "", 0 }, arena_copy_sv(arena, p->text_accum));
                 } else if (ptype == "custom_tool_call" || ptype == "function_call") {
-                    p->tool_accum.assign(name.empty() ? "tool" : name);
-                    if (!call_input.empty()) {
-                        p->tool_accum.append(": ");
-                        p->tool_accum.append(call_input);
-                    }
-                    bool trunc = false;
                     uint32_t max_b = opts->tool_call_max_bytes ? opts->tool_call_max_bytes : 512u;
-                    StelogStr txt = stelog_truncate_middle(arena, p->tool_accum.data(), p->tool_accum.size(), max_b, &trunc);
-                    if (!trunc) txt = arena_copy_sv(arena, p->tool_accum);
+                    p->tool_accum.assign(name.empty() ? "tool" : name);
+                    p->tool_accum.append(": ");
+                    size_t head_len = p->tool_accum.size();
+                    /* Patches wrapped in exec/shell calls name their files deep inside the input; hoist the
+                       file markers so file history still sees them after truncation. */
+                    collect_patch_file_header(call_input, p->tmp_str);
+                    if (!p->tmp_str.empty() && !(name == "apply_patch" && call_input.size() + head_len <= max_b)) {
+                        p->tool_accum.append(p->tmp_str);
+                    }
+                    size_t prefix_len = p->tool_accum.size();
+                    bool trunc = false;
+                    StelogStr txt;
+                    if (prefix_len + call_input.size() <= max_b) {
+                        p->tool_accum.append(call_input);
+                        txt = arena_copy_sv(arena, p->tool_accum);
+                    } else {
+                        size_t body_cap = (max_b > prefix_len + 128u) ? (max_b - prefix_len) : 128u;
+                        StelogStr body = stelog_truncate_middle(arena, call_input.data(), call_input.size(), (uint32_t)body_cap, &trunc);
+                        p->tool_accum.append(body.ptr, body.len);
+                        txt = arena_copy_sv(arena, p->tool_accum);
+                    }
+                    if (call_input.empty() && txt.len >= 2 && txt.ptr[txt.len - 2] == ':') txt.len -= 2;
                     StelogStr actor = ctx->actor.len ? ctx->actor : StelogStr{ "codex:main", 10 };
                     emit_event(out, STELOG_AGENT_CODEX, STELOG_ROLE_TOOL_CALL,
                                trunc ? STELOG_FLAG_TRUNCATED : 0, ts_ms,
@@ -491,25 +617,23 @@ extern "C" int stelog_json_parse_agy_line(StelogJsonParser *p,
                     ondemand::object tc;
                     if (elem.get_object().get(tc) != SUCCESS) continue;
                     std::string tname;
-                    std::string_view raw_args;
+                    std::string args_s;
                     for (auto tf : tc) {
                         ondemand::raw_json_string tk;
                         if (tf.key().get(tk) != SUCCESS) continue;
                         if (tk == "name") {
                             (void)tf.value().get_string(tname);
                         } else if (tk == "arguments" || tk == "args") {
-                            if (tf.value().raw_json().get(raw_args) != SUCCESS) {
-                                raw_args = {};
-                            }
+                            ondemand::value av;
+                            if (tf.value().get(av) == SUCCESS) append_tool_args(args_s, av, 256);
                         }
                     }
                     if (!tname.empty()) {
                         if (!p->tool_accum.empty()) p->tool_accum.append("\n");
                         p->tool_accum.append(tname);
-                        if (!raw_args.empty()) {
+                        if (!args_s.empty()) {
                             p->tool_accum.append(": ");
-                            size_t cap = raw_args.size() < 256 ? raw_args.size() : 256;
-                            p->tool_accum.append(raw_args.data(), cap);
+                            p->tool_accum.append(args_s);
                         }
                     }
                 }
@@ -655,7 +779,7 @@ extern "C" int stelog_json_parse_pi_line(StelogJsonParser *p,
                             ondemand::object co;
                             if (ce.get_object().get(co) != SUCCESS) continue;
                             std::string ctype, ctext, cthink, cname;
-                            std::string_view cargs;
+                            std::string cargs;
                             for (auto cf : co) {
                                 ondemand::raw_json_string ck;
                                 if (cf.key().get(ck) != SUCCESS) continue;
@@ -665,7 +789,8 @@ extern "C" int stelog_json_parse_pi_line(StelogJsonParser *p,
                                     if (opts->include_thinking) (void)cf.value().get_string(cthink);
                                 } else if (ck == "name") (void)cf.value().get_string(cname);
                                 else if (ck == "arguments") {
-                                    if (cf.value().raw_json().get(cargs) != SUCCESS) cargs = {};
+                                    ondemand::value av;
+                                    if (cf.value().get(av) == SUCCESS) append_tool_args(cargs, av, 256);
                                 }
                             }
                             if (ctype == "text" && !ctext.empty()) {
@@ -677,8 +802,7 @@ extern "C" int stelog_json_parse_pi_line(StelogJsonParser *p,
                                 p->tool_accum.append(cname);
                                 if (!cargs.empty()) {
                                     p->tool_accum.append(": ");
-                                    size_t cap = cargs.size() < 256 ? cargs.size() : 256;
-                                    p->tool_accum.append(cargs.data(), cap);
+                                    p->tool_accum.append(cargs);
                                 }
                             }
                         }
@@ -767,7 +891,240 @@ extern "C" int stelog_json_parse_pi_line(StelogJsonParser *p,
 }
 
 /* ============================================================================
- * 4. MCP JSON-RPC 2.0 Request Parser (powered by simdjson On-Demand)
+ * 4. Factory Droid Session Parser (~/.factory/sessions/<cwd-slug>/<session>.jsonl)
+ * ============================================================================ */
+
+static inline bool is_droid_reminder(std::string_view sv) {
+    return starts_with(trim_ws(sv), "<system-reminder>");
+}
+
+static void append_droid_tool_result(std::string &dst, ondemand::value &v) {
+    ondemand::json_type jt;
+    if (v.type().get(jt) != SUCCESS) return;
+    if (jt == ondemand::json_type::string) {
+        std::string_view s;
+        if (v.get_string().get(s) == SUCCESS) append_with_newline(dst, s);
+        return;
+    }
+    if (jt != ondemand::json_type::array) return;
+    ondemand::array arr;
+    if (v.get_array().get(arr) != SUCCESS) return;
+    for (auto el : arr) {
+        ondemand::object o;
+        if (el.get_object().get(o) != SUCCESS) continue;
+        for (auto of : o) {
+            ondemand::raw_json_string ok;
+            if (of.key().get(ok) != SUCCESS) continue;
+            if (ok == "text") {
+                std::string_view s;
+                if (of.value().get_string().get(s) == SUCCESS) append_with_newline(dst, s);
+            }
+        }
+    }
+}
+
+extern "C" int stelog_json_parse_droid_line(StelogJsonParser *p,
+                                            const char *line,
+                                            size_t line_len,
+                                            size_t padded_cap,
+                                            uint32_t file_id,
+                                            uint64_t raw_offset,
+                                            const StelogParseOptions *opts,
+                                            StelogStreamContext *ctx,
+                                            StelogArena *arena,
+                                            StelogLineResult *out) {
+    std::memset(out, 0, sizeof(*out));
+    p->text_accum.clear();
+    p->think_accum.clear();
+    p->tool_accum.clear();
+
+    ondemand::document doc;
+    if (p->parser.iterate(p->make_view(line, line_len, padded_cap)).get(doc) != SUCCESS) {
+        return -1;
+    }
+    ondemand::object root;
+    if (doc.get_object().get(root) != SUCCESS) {
+        return -1;
+    }
+
+    int64_t ts_ms = 0;
+    std::string top_type, id, parent_id, title, cwd, calling_sid;
+    std::string role, visibility, model_id;
+    std::string sys_text, tool_res;
+    bool system_notice = false;
+
+    for (auto field : root) {
+        ondemand::raw_json_string key;
+        if (field.key().get(key) != SUCCESS) continue;
+        if (key == "type") {
+            (void)field.value().get_string(top_type);
+        } else if (key == "id") {
+            (void)field.value().get_string(id);
+        } else if (key == "parentId") {
+            (void)field.value().get_string(parent_id);
+        } else if (key == "timestamp") {
+            std::string_view sv;
+            if (field.value().get_string().get(sv) == SUCCESS) {
+                ts_ms = stelog_parse_iso8601_ms(sv.data(), sv.size());
+            }
+        } else if (key == "title") {
+            (void)field.value().get_string(title);
+        } else if (key == "cwd") {
+            (void)field.value().get_string(cwd);
+        } else if (key == "callingSessionId") {
+            (void)field.value().get_string(calling_sid);
+        } else if (key == "message") {
+            ondemand::object mobj;
+            if (field.value().get_object().get(mobj) != SUCCESS) continue;
+            for (auto mf : mobj) {
+                ondemand::raw_json_string mk;
+                if (mf.key().get(mk) != SUCCESS) continue;
+                if (mk == "role") {
+                    (void)mf.value().get_string(role);
+                } else if (mk == "visibility") {
+                    (void)mf.value().get_string(visibility);
+                } else if (mk == "systemNotice") {
+                    (void)mf.value().get_bool().get(system_notice);
+                } else if (mk == "modelId") {
+                    (void)mf.value().get_string(model_id);
+                } else if (mk == "content") {
+                    ondemand::array carr;
+                    if (mf.value().get_array().get(carr) != SUCCESS) {
+                        if (mf.value().get_string(p->tmp_str) == SUCCESS) {
+                            append_with_newline(is_droid_reminder(p->tmp_str) ? sys_text : p->text_accum, p->tmp_str);
+                        }
+                        continue;
+                    }
+                    for (auto ce : carr) {
+                        ondemand::object co;
+                        if (ce.get_object().get(co) != SUCCESS) continue;
+                        std::string ctype, cname;
+                        std::string ctext, cthink, cargs;
+                        bool has_result = false;
+                        std::string cres;
+                        for (auto cf : co) {
+                            ondemand::raw_json_string ck;
+                            if (cf.key().get(ck) != SUCCESS) continue;
+                            if (ck == "type") {
+                                (void)cf.value().get_string(ctype);
+                            } else if (ck == "text") {
+                                (void)cf.value().get_string(ctext);
+                            } else if (ck == "thinking") {
+                                if (opts->include_thinking) (void)cf.value().get_string(cthink);
+                            } else if (ck == "name") {
+                                (void)cf.value().get_string(cname);
+                            } else if (ck == "input") {
+                                ondemand::value av;
+                                if (cf.value().get(av) == SUCCESS) append_tool_args(cargs, av, 256);
+                            } else if (ck == "content") {
+                                if (opts->include_tool_results) {
+                                    ondemand::value rv;
+                                    if (cf.value().get(rv) == SUCCESS) {
+                                        append_droid_tool_result(cres, rv);
+                                        has_result = true;
+                                    }
+                                }
+                            }
+                        }
+                        if (ctype == "text" && !ctext.empty()) {
+                            append_with_newline(is_droid_reminder(ctext) ? sys_text : p->text_accum, ctext);
+                        } else if (ctype == "thinking" && !cthink.empty()) {
+                            append_with_newline(p->think_accum, cthink);
+                        } else if (ctype == "tool_use" && !cname.empty()) {
+                            if (!p->tool_accum.empty()) p->tool_accum.push_back('\n');
+                            p->tool_accum.append(cname);
+                            if (!cargs.empty()) {
+                                p->tool_accum.append(": ");
+                                p->tool_accum.append(cargs);
+                            }
+                        } else if (ctype == "tool_result" && has_result && !cres.empty()) {
+                            append_with_newline(tool_res, cres);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (top_type == "session_start") {
+        if (!id.empty()) ctx->session_id = arena_copy_sv(arena, id);
+        if (!cwd.empty()) ctx->cwd = arena_copy_sv(arena, cwd);
+        if (!title.empty() && title != "New Session" && title != "新会话") ctx->title = arena_copy_sv(arena, title);
+        if (!calling_sid.empty()) {
+            ctx->parent_session_id = arena_copy_sv(arena, calling_sid);
+            ctx->session_flags |= STELOG_FLAG_IS_SUBAGENT;
+        }
+        out->updated_context = true;
+        return 0;
+    }
+    if (top_type != "message") return 0;
+
+    StelogStr msg_id_s = arena_copy_sv(arena, id);
+    StelogStr parent_id_s = arena_copy_sv(arena, parent_id);
+
+    if (role == "user") {
+        /* llm_only user turns are harness context (system reminders, tool catalogs), not human input */
+        bool harness = (visibility == "llm_only") || system_notice || starts_with(id, "__internal__");
+        if (harness) {
+            append_with_newline(sys_text, p->text_accum);
+            p->text_accum.clear();
+        }
+        if (!p->text_accum.empty()) {
+            StelogStr actor = { "user", 4 };
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_USER, 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor,
+                       msg_id_s, parent_id_s, arena_copy_sv(arena, p->text_accum));
+        }
+        if (opts->include_system && !sys_text.empty()) {
+            StelogStr actor = { "system", 6 };
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_SYSTEM, 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor,
+                       msg_id_s, parent_id_s, arena_copy_sv(arena, sys_text));
+        }
+        if (opts->include_tool_results && !tool_res.empty()) {
+            bool trunc = false;
+            StelogStr txt = stelog_truncate_middle(arena, tool_res.data(), tool_res.size(), 4096u, &trunc);
+            if (!trunc) txt = arena_copy_sv(arena, tool_res);
+            StelogStr actor = { "tool", 4 };
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_TOOL_RESULT,
+                       trunc ? STELOG_FLAG_TRUNCATED : 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor, msg_id_s, parent_id_s, txt);
+        }
+    } else if (role == "assistant") {
+        if (!model_id.empty()) {
+            std::string actor_s = "droid:" + model_id;
+            if (ctx->actor.len != actor_s.size() || std::memcmp(ctx->actor.ptr, actor_s.data(), actor_s.size()) != 0) {
+                ctx->actor = arena_copy_sv(arena, actor_s);
+                out->updated_context = true;
+            }
+        }
+        StelogStr actor = ctx->actor.len ? ctx->actor : StelogStr{ "droid:main", 10 };
+        if (!p->text_accum.empty()) {
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_ASSISTANT, 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor,
+                       msg_id_s, parent_id_s, arena_copy_sv(arena, p->text_accum));
+        }
+        if (!p->tool_accum.empty()) {
+            bool trunc = false;
+            uint32_t max_b = opts->tool_call_max_bytes ? opts->tool_call_max_bytes : 512u;
+            StelogStr txt = stelog_truncate_middle(arena, p->tool_accum.data(), p->tool_accum.size(), max_b, &trunc);
+            if (!trunc) txt = arena_copy_sv(arena, p->tool_accum);
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_TOOL_CALL,
+                       trunc ? STELOG_FLAG_TRUNCATED : 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor,
+                       msg_id_s, parent_id_s, txt);
+        }
+        if (opts->include_thinking && !p->think_accum.empty()) {
+            emit_event(out, STELOG_AGENT_DROID, STELOG_ROLE_THINKING, 0, ts_ms,
+                       file_id, raw_offset, (uint32_t)line_len, ctx, actor,
+                       msg_id_s, parent_id_s, arena_copy_sv(arena, p->think_accum));
+        }
+    }
+    return 0;
+}
+
+/* ============================================================================
+ * 5. MCP JSON-RPC 2.0 Request Parser (powered by simdjson On-Demand)
  * ============================================================================ */
 
 static void parse_mcp_arguments(ondemand::object &args, StelogArena *arena, StelogMcpRequest *out) {
@@ -918,6 +1275,20 @@ extern "C" int stelog_json_parse_mcp_request(StelogJsonParser *p,
                 if (pk == "name") {
                     if (pf.value().get_string(tmp) == SUCCESS) {
                         out->tool_name = arena_copy_sv(arena, tmp);
+                    }
+                } else if (pk == "protocolVersion") {
+                    if (pf.value().get_string(tmp) == SUCCESS) {
+                        out->protocol_version = arena_copy_sv(arena, tmp);
+                    }
+                } else if (pk == "clientInfo") {
+                    ondemand::object ci;
+                    if (pf.value().get_object().get(ci) != SUCCESS) continue;
+                    for (auto cf : ci) {
+                        ondemand::raw_json_string ck;
+                        if (cf.key().get(ck) != SUCCESS) continue;
+                        if (ck == "name" && cf.value().get_string(tmp) == SUCCESS) {
+                            out->client_name = arena_copy_sv(arena, tmp);
+                        }
                     }
                 } else if (pk == "arguments") {
                     ondemand::object args;

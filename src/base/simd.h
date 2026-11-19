@@ -51,6 +51,9 @@ bool stelog_agy_should_skip_line(const char *line, size_t line_len,
 bool stelog_pi_should_skip_line(const char *line, size_t line_len,
                                 bool include_tool_results);
 
+bool stelog_droid_should_skip_line(const char *line, size_t line_len,
+                                   bool include_tool_results);
+
 /*
  * UTF-8 boundary-safe Middle Truncation (Codex & Pi convention):
  * Keeps ~half max_bytes at the head and ~half at the tail, inserting "…N chars truncated…" in the middle.

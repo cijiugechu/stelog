@@ -81,14 +81,49 @@ void stelog_jw_arr_end(StelogJsonWriter *w) {
     w->need_comma = true;
 }
 
+/* Length of the valid UTF-8 sequence starting at s[i] (2..4 bytes), or 0 if it is truncated,
+   malformed, overlong, a surrogate, or beyond U+10FFFF. */
+static size_t utf8_valid_seq_len(const unsigned char *s, size_t i, size_t len) {
+    unsigned char c = s[i];
+    size_t need;
+    unsigned char lo = 0x80u, hi = 0xBFu;
+    if (c >= 0xC2u && c <= 0xDFu) need = 1;
+    else if (c == 0xE0u) { need = 2; lo = 0xA0u; }
+    else if (c >= 0xE1u && c <= 0xECu) need = 2;
+    else if (c == 0xEDu) { need = 2; hi = 0x9Fu; }
+    else if (c >= 0xEEu && c <= 0xEFu) need = 2;
+    else if (c == 0xF0u) { need = 3; lo = 0x90u; }
+    else if (c >= 0xF1u && c <= 0xF3u) need = 3;
+    else if (c == 0xF4u) { need = 3; hi = 0x8Fu; }
+    else return 0;
+    if (i + need >= len) return 0;
+    if (s[i + 1] < lo || s[i + 1] > hi) return 0;
+    for (size_t k = 2; k <= need; ++k) {
+        if ((s[i + k] & 0xC0u) != 0x80u) return 0;
+    }
+    return need + 1;
+}
+
+/* Escapes for JSON and replaces invalid UTF-8 with U+FFFD so every emitted document parses. */
 static void jw_write_escaped_str(StelogJsonWriter *w, const char *s, size_t len) {
     jw_reserve(w, len + 2);
     jw_putc(w, '"');
     if (s && len > 0) {
+        const unsigned char *u = (const unsigned char *)s;
         size_t chunk_start = 0;
-        for (size_t i = 0; i < len; ++i) {
-            unsigned char c = (unsigned char)s[i];
-            if (c >= 0x20u && c != '"' && c != '\\') continue;
+        size_t i = 0;
+        while (i < len) {
+            unsigned char c = u[i];
+            if (c >= 0x80u) {
+                size_t sl = utf8_valid_seq_len(u, i, len);
+                if (sl > 0) { i += sl; continue; }
+                if (i > chunk_start) jw_puts(w, s + chunk_start, i - chunk_start);
+                jw_puts(w, "\xEF\xBF\xBD", 3);
+                i++;
+                chunk_start = i;
+                continue;
+            }
+            if (c >= 0x20u && c != '"' && c != '\\') { i++; continue; }
             if (i > chunk_start) jw_puts(w, s + chunk_start, i - chunk_start);
             switch (c) {
                 case '"':  jw_puts(w, "\\\"", 2); break;
@@ -105,13 +140,13 @@ static void jw_write_escaped_str(StelogJsonWriter *w, const char *s, size_t len)
                     break;
                 }
             }
-            chunk_start = i + 1;
+            i++;
+            chunk_start = i;
         }
         if (len > chunk_start) jw_puts(w, s + chunk_start, len - chunk_start);
     }
     jw_putc(w, '"');
 }
-
 void stelog_jw_key(StelogJsonWriter *w, const char *key) {
     jw_comma(w);
     jw_write_escaped_str(w, key, strlen(key));

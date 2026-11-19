@@ -1,11 +1,11 @@
 ---
 name: stelog
-description: "Ultra-fast local coding agent history search and decision archaeology across Codex CLI (~/.codex), AGY CLI (~/.gemini/antigravity-cli), and Pi (~/.pi/agent). Use whenever asked when or who made a decision, why a design changed, which session edited a file, or before writing ad-hoc grep/jq/python scripts over local session .jsonl files."
+description: "Ultra-fast local coding agent history search and decision archaeology across Codex CLI (~/.codex), AGY CLI (~/.gemini/antigravity-cli), Pi (~/.pi/agent), and Factory Droid (~/.factory/sessions). Use whenever asked when or who made a decision, why a design changed, which session edited a file, or before writing ad-hoc grep/jq/python scripts over local session .jsonl files."
 ---
 
 # stelog
 
-`stelog` indexes local coding agent session transcripts (Codex CLI, AGY CLI, Pi) into a compact Data-Oriented mmap index (microsecond queries, automatic Hot Delta refresh). Use `stelog` (via MCP tools or CLI) instead of manually grepping raw `.jsonl` / `.jsonl.zst` files.
+`stelog` indexes local coding agent session transcripts (Codex CLI, AGY CLI, Pi, Factory Droid) into a compact Data-Oriented mmap index (microsecond queries, automatic Hot Delta refresh). Use `stelog` (via MCP tools or CLI) instead of manually grepping raw `.jsonl` / `.jsonl.zst` files.
 
 ## Laws
 
@@ -16,7 +16,7 @@ description: "Ultra-fast local coding agent history search and decision archaeol
 ## Optimal 2-Step Decision Archaeology Workflow
 
 1. **Locate the right session first (~500 B)**: `stelog search "镜像 | mirror" [.] --group-by session` (or MCP `search_history(query="镜像 | mirror", group_by="session")`). Use `|` / `OR` to cover bilingual Chinese+English terms in one shot.
-2. **Read the entire decision stream (~6–12 KB)**: `stelog digest @<sid8>` (or MCP `get_session_digest(session="@<sid8>")`). Collapses intermediate tool calls, deduplicates retries, and preserves ending options/conclusions of long assistant turns.
+2. **Read the entire decision stream (~6–12 KB)**: `stelog digest @<sid8>` (or MCP `get_session_digest(session="@<sid8>")`). Collapses intermediate tool calls, deduplicates retries, and preserves ending options/conclusions of long assistant turns. Long sessions show the opening and closing turns plus an omitted-range marker; pass `offset` (CLI `--offset`) to read the middle.
 
 ## Route by Question
 

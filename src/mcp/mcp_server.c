@@ -106,28 +106,53 @@ static void bt_append_sanitized(BoundedText *bt, const char *s, size_t len) {
  * Filter Parsing Helpers (shared semantics with CLI)
  * ============================================================================ */
 
+/* Local time with an explicit UTC offset ("2026-11-19 21:22:11+08:00") so agents can compare it against
+   other clocks, and so it can be pasted back into since/until unchanged. */
 static void fmt_ts_iso(int64_t ts_ms, char *out, size_t cap) {
     if (ts_ms <= 0) { snprintf(out, cap, "unknown"); return; }
     time_t sec = (time_t)(ts_ms / 1000ll);
     struct tm tm_buf;
     localtime_r(&sec, &tm_buf);
-    strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tm_buf);
+    char base[24], zone[8];
+    strftime(base, sizeof(base), "%Y-%m-%d %H:%M:%S", &tm_buf);
+    if (strftime(zone, sizeof(zone), "%z", &tm_buf) == 5) {
+        snprintf(out, cap, "%s%.3s:%.2s", base, zone, zone + 3);
+    } else {
+        snprintf(out, cap, "%s", base);
+    }
 }
 
-static int64_t parse_time_arg(StelogStr s) {
-    if (!s.ptr || s.len == 0) return 0;
-    if (s.len >= 2 && (s.ptr[s.len - 1] == 'd' || s.ptr[s.len - 1] == 'h')) {
-        char *end = NULL;
-        long val = strtol(s.ptr, &end, 10);
-        if (end == s.ptr + s.len - 1 && val > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t now_ms = (int64_t)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000ll;
-            int64_t d = (s.ptr[s.len - 1] == 'd') ? (val * 86400ll * 1000ll) : (val * 3600ll * 1000ll);
-            return now_ms - d;
+/* RFC 3339 form of fmt_ts_iso for structuredContent ("2026-11-19T21:22:11+08:00"). */
+static void fmt_ts_rfc3339(int64_t ts_ms, char *out, size_t cap) {
+    fmt_ts_iso(ts_ms, out, cap);
+    if (strlen(out) > 10 && out[10] == ' ') out[10] = 'T';
+}
+
+/* Writes a user-facing message into err and returns false when since/until cannot be parsed. */
+static bool parse_time_range(const StelogMcpRequest *req, int64_t *since_ms, int64_t *until_ms, char *err, size_t err_cap) {
+    *since_ms = 0;
+    *until_ms = 0;
+    const StelogStr *vals[2] = { &req->arg_since, &req->arg_until };
+    int64_t *outs[2] = { since_ms, until_ms };
+    static const char *names[2] = { "since", "until" };
+    for (int i = 0; i < 2; ++i) {
+        const StelogStr *v = vals[i];
+        if (!v->ptr || v->len == 0) continue;
+        if (!stelog_parse_time_arg(v->ptr, v->len, i == 1, outs[i])) {
+            snprintf(err, err_cap,
+                     "Invalid %s=\"%.*s\". Use a relative offset (30m, 24h, 7d, 2w), today, yesterday, "
+                     "YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS] (local time unless Z or +HH:MM is given).",
+                     names[i], (int)(v->len > 64 ? 64 : v->len), v->ptr);
+            return false;
         }
     }
-    return stelog_parse_iso8601_ms(s.ptr, s.len);
+    if (*since_ms && *until_ms && *since_ms > *until_ms) {
+        snprintf(err, err_cap, "Invalid time range: since (%.*s) is after until (%.*s).",
+                 (int)(req->arg_since.len > 64 ? 64 : req->arg_since.len), req->arg_since.ptr,
+                 (int)(req->arg_until.len > 64 ? 64 : req->arg_until.len), req->arg_until.ptr);
+        return false;
+    }
+    return true;
 }
 
 static uint32_t parse_agent_csv(StelogStr s) {
@@ -142,6 +167,7 @@ static uint32_t parse_agent_csv(StelogStr s) {
         if (l == 5 && memcmp(p, "codex", 5) == 0) mask |= (1u << STELOG_AGENT_CODEX);
         else if (l == 3 && memcmp(p, "agy", 3) == 0) mask |= (1u << STELOG_AGENT_AGY);
         else if (l == 2 && memcmp(p, "pi", 2) == 0) mask |= (1u << STELOG_AGENT_PI);
+        else if (l == 5 && memcmp(p, "droid", 5) == 0) mask |= (1u << STELOG_AGENT_DROID);
         if (!c) break;
         p = c + 1;
     }
@@ -194,6 +220,76 @@ static StelogCountByAxis parse_count_by(StelogStr s) {
     return STELOG_COUNT_BY_NONE;
 }
 
+static uint32_t short_sid_len(const StelogIndex *idx, StelogStr sid) {
+    return stelog_index_unique_prefix_len(idx, sid, 8u);
+}
+
+/* ============================================================================
+ * structuredContent Builder (shapes declared as outputSchema in tools_list.json)
+ * ============================================================================ */
+
+/* Off for clients that would show structuredContent to the model in place of the text result (Codex). */
+static bool g_structured_output = true;
+static StelogJsonWriter g_sc;    /* structuredContent object of the current tool result */
+static StelogJsonWriter g_notes; /* items of its "notes" array */
+
+static StelogJsonWriter *sc_begin(void) {
+    stelog_jw_reset(&g_sc);
+    stelog_jw_reset(&g_notes);
+    stelog_jw_obj_begin(&g_sc);
+    return &g_sc;
+}
+
+static void sc_kv_s(StelogJsonWriter *sc, const char *key, StelogStr s) {
+    stelog_jw_kv_str(sc, key, s.ptr ? s.ptr : "", s.ptr ? s.len : 0);
+}
+
+static void sc_kv_ts(StelogJsonWriter *sc, const char *key, int64_t ts_ms) {
+    char b[48];
+    fmt_ts_rfc3339(ts_ms, b, sizeof(b));
+    stelog_jw_kv_cstr(sc, key, b);
+}
+
+static void sc_kv_session(StelogJsonWriter *sc, const char *key, const StelogIndex *idx, StelogStr sid) {
+    char b[80];
+    uint32_t n = stelog_index_unique_prefix_len(idx, sid, 8u);
+    if (n > sid.len) n = sid.len;
+    if (n > sizeof(b) - 2) n = (uint32_t)sizeof(b) - 2;
+    b[0] = '@';
+    if (n > 0) memcpy(b + 1, sid.ptr, n);
+    stelog_jw_kv_str(sc, key, b, (size_t)n + 1);
+}
+
+/* Appends a "Note:"/"Hint:" line to the text result and mirrors it into structuredContent.notes. */
+static void bt_note(BoundedText *bt, const char *fmt, ...) {
+    char tmp[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    size_t use = (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1;
+    bt_append_raw(bt, tmp, use);
+    while (use > 0 && tmp[use - 1] == '\n') use--;
+    stelog_jw_str(&g_notes, tmp, use);
+}
+
+static void sc_finish(StelogJsonWriter *sc) {
+    if (g_notes.len > 0) {
+        stelog_jw_key(sc, "notes");
+        stelog_jw_arr_begin(sc);
+        stelog_jw_raw(sc, g_notes.buf, g_notes.len);
+        stelog_jw_arr_end(sc);
+    }
+    stelog_jw_obj_end(sc);
+}
+
+static bool query_has_upper(StelogStr q) {
+    for (uint32_t i = 0; i < q.len; ++i) {
+        if (q.ptr[i] >= 'A' && q.ptr[i] <= 'Z') return true;
+    }
+    return false;
+}
 /* ============================================================================
  * JSON-RPC 2.0 Envelope Helpers
  * ============================================================================ */
@@ -207,7 +303,9 @@ static void write_rpc_id(StelogJsonWriter *w, const StelogMcpRequest *req) {
     }
 }
 
-static void send_rpc_tool_text(StelogJsonWriter *w, const StelogMcpRequest *req, const char *text, size_t len, bool is_error) {
+/* sc (already finished with sc_finish) is attached as structuredContent when the client wants it. */
+static void send_rpc_tool_result(StelogJsonWriter *w, const StelogMcpRequest *req, const char *text, size_t len,
+                                 bool is_error, const StelogJsonWriter *sc) {
     stelog_jw_reset(w);
     stelog_jw_obj_begin(w);
     stelog_jw_kv_cstr(w, "jsonrpc", "2.0");
@@ -221,12 +319,25 @@ static void send_rpc_tool_text(StelogJsonWriter *w, const StelogMcpRequest *req,
     stelog_jw_kv_str(w, "text", text, len);
     stelog_jw_obj_end(w);
     stelog_jw_arr_end(w);
+    if (sc && g_structured_output) {
+        stelog_jw_key(w, "structuredContent");
+        stelog_jw_raw(w, sc->buf, sc->len);
+    }
     if (is_error) stelog_jw_kv_bool(w, "isError", true);
     stelog_jw_obj_end(w);
     stelog_jw_obj_end(w);
     fwrite(w->buf, 1, w->len, stdout);
     fputc('\n', stdout);
     fflush(stdout);
+}
+
+static void send_rpc_tool_text(StelogJsonWriter *w, const StelogMcpRequest *req, const char *text, size_t len, bool is_error) {
+    send_rpc_tool_result(w, req, text, len, is_error, NULL);
+}
+
+static void send_rpc_tool_sc(StelogJsonWriter *w, const StelogMcpRequest *req, const BoundedText *bt, StelogJsonWriter *sc) {
+    sc_finish(sc);
+    send_rpc_tool_result(w, req, bt->buf, bt->len, false, sc);
 }
 
 static void send_rpc_error(StelogJsonWriter *w, const StelogMcpRequest *req, int code, const char *msg) {
@@ -254,7 +365,40 @@ extern const char stelog_mcp_initialize_json[];
 extern const size_t stelog_mcp_initialize_json_len;
 extern const char stelog_mcp_tools_list_json[];
 extern const size_t stelog_mcp_tools_list_json_len;
+extern const char stelog_mcp_tools_list_plain_json[];
+extern const size_t stelog_mcp_tools_list_plain_json_len;
 
+/* Codex hands structuredContent to the model instead of the text content, which would hide the
+   formatted results and next-step hints, so it gets plain text results. */
+static bool client_wants_structured(StelogStr client_name) {
+    return !(client_name.len > 0 && stelog_memcasemem(client_name.ptr, client_name.len, "codex", 5) != NULL);
+}
+
+static const char *const kSupportedProtocolVersions[] = { "2025-06-18", "2025-03-26", "2024-11-05" };
+
+/* Echo the client's protocolVersion when supported, otherwise offer the newest one we speak. */
+static void write_initialize_result(StelogJsonWriter *w, StelogStr requested) {
+    const char *ver = kSupportedProtocolVersions[0];
+    for (size_t i = 0; i < sizeof(kSupportedProtocolVersions) / sizeof(kSupportedProtocolVersions[0]); ++i) {
+        size_t l = strlen(kSupportedProtocolVersions[i]);
+        if (requested.len == l && memcmp(requested.ptr, kSupportedProtocolVersions[i], l) == 0) {
+            ver = kSupportedProtocolVersions[i];
+            break;
+        }
+    }
+    /* initialize.json is a minified object without protocolVersion; splice it in as the first key */
+    const char *body = stelog_mcp_initialize_json;
+    size_t body_len = stelog_mcp_initialize_json_len;
+    char *tmp = (char *)malloc(body_len + 64u);
+    if (!tmp) {
+        stelog_jw_raw(w, body, body_len);
+        return;
+    }
+    int n = snprintf(tmp, 64u, "{\"protocolVersion\":\"%s\",", ver);
+    memcpy(tmp + n, body + 1, body_len - 1);
+    stelog_jw_raw(w, tmp, (size_t)n + body_len - 1);
+    free(tmp);
+}
 /* ============================================================================
  * MCP Tool Call Handlers
  * ============================================================================ */
@@ -269,8 +413,11 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
     q.project_substr    = req->arg_project.len ? req->arg_project.ptr : NULL;
     q.actor_substr      = req->arg_actor.len ? req->arg_actor.ptr : NULL;
     q.session_id        = req->arg_session.len ? req->arg_session.ptr : NULL;
-    q.since_ms          = parse_time_arg(req->arg_since);
-    q.until_ms          = parse_time_arg(req->arg_until);
+    char time_err[320];
+    if (!parse_time_range(req, &q.since_ms, &q.until_ms, time_err, sizeof(time_err))) {
+        send_rpc_tool_text(w, req, time_err, strlen(time_err), true);
+        return;
+    }
     q.limit             = req->arg_limit ? req->arg_limit : (is_timeline ? 10u : 15u);
     q.offset            = req->arg_offset;
     q.snippet_max_bytes = is_timeline ? 320u : 420u;
@@ -303,39 +450,83 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
         return;
     }
 
+    StelogIndexStats ist;
+    stelog_index_get_stats(idx, &ist);
+    uint32_t content_flags = ist.content_flags;
+
     BoundedText bt;
     uint32_t text_budget = (req->arg_limit > 20u) ? MCP_MAX_TEXT_BYTES : MCP_INLINE_SOFT_BYTES;
     bt_init(&bt, text_budget, MCP_MAX_TEXT_LINES);
+    StelogJsonWriter *sc = sc_begin();
+    const char *mode = q.group_by_session ? "sessions" : (q.count_by != STELOG_COUNT_BY_NONE ? "counts" : "hits");
+    stelog_jw_kv_cstr(sc, "mode", mode);
+    stelog_jw_kv_u64(sc, "total_matches", sr.total_matches);
+    stelog_jw_kv_double(sc, "elapsed_ms", sr.elapsed_ms);
+    if (req->arg_include_tools && !(content_flags & STELOG_INDEX_HAS_TOOL_RESULTS)) {
+        bt_note(&bt, "Note: include_tools has no effect because this index was built without tool outputs (rebuild with `stelog index --rebuild --include-tools`).\n");
+    }
+    if (req->arg_include_thinking && !(content_flags & STELOG_INDEX_HAS_THINKING)) {
+        bt_note(&bt, "Note: include_thinking has no effect because this index was built without thinking blocks (rebuild with `stelog index --rebuild --include-thinking`).\n");
+    }
 
     if (sr.total_matches == 0) {
+        stelog_jw_key(sc, mode);
+        stelog_jw_arr_begin(sc);
+        stelog_jw_arr_end(sc);
+        stelog_jw_kv_u64(sc, "shown", 0);
         bt_printf_force(&bt, "0 matches across %u indexed docs in scope (%.3f ms).\n", sr.docs_in_scope, sr.elapsed_ms);
         if (sr.unfiltered_total_matches > 0) {
-            bt_printf_force(&bt, "Note: %u matches exist outside current filters (", sr.unfiltered_total_matches);
-            bool first = true;
-            for (int r = 0; r < STELOG_ROLE_COUNT; ++r) {
+            char roles[256];
+            size_t rl = 0;
+            roles[0] = '\0';
+            for (int r = 0; r < STELOG_ROLE_COUNT && rl < sizeof(roles); ++r) {
                 if (sr.other_role_counts[r] > 0) {
-                    bt_printf_force(&bt, "%s%s=%u", first ? "" : ", ", stelog_role_name((StelogRoleKind)r), sr.other_role_counts[r]);
-                    first = false;
+                    int n = snprintf(roles + rl, sizeof(roles) - rl, "%s%s=%u", rl ? ", " : "",
+                                     stelog_role_name((StelogRoleKind)r), sr.other_role_counts[r]);
+                    if (n > 0) rl += (size_t)n;
                 }
             }
-            bt_printf_force(&bt, "). Retry with broader agent/project/role filters or include_tools=true.\n");
+            bt_note(&bt, "Note: %u matches exist outside current filters (%s). Retry with broader agent/project/role/time filters%s.\n",
+                    sr.unfiltered_total_matches, roles,
+                    (content_flags & STELOG_INDEX_HAS_TOOL_RESULTS) ? " or include_tools=true" : "");
         } else {
-            bt_printf_force(&bt, "Definitive absence in indexed decision layers (user/assistant/inter_agent/tool_call). Note: large tool_result outputs and thinking blocks are excluded unless indexed.\n");
+            bt_note(&bt, "No match in the indexed layers (user/assistant/inter_agent/tool_call%s%s%s).\n",
+                    (content_flags & STELOG_INDEX_HAS_TOOL_RESULTS) ? "/tool_result" : "",
+                    (content_flags & STELOG_INDEX_HAS_THINKING) ? "/thinking" : "",
+                    (content_flags & STELOG_INDEX_HAS_SYSTEM) ? "/system" : "");
         }
-        send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+        if (q.case_mode == STELOG_CASE_SMART && !q.regex_mode && query_has_upper(req->arg_query)) {
+            bt_note(&bt, "Hint: the query contains uppercase, so smart case matched case-sensitively; retry with case=\"insensitive\".\n");
+        }
+        if (!(content_flags & STELOG_INDEX_HAS_TOOL_RESULTS)) {
+            bt_note(&bt, "Hint: tool outputs are not indexed; run `stelog index --rebuild --include-tools` to make them searchable.\n");
+        }
+        if (q.since_ms || q.until_ms || q.project_substr || q.agent_mask || q.session_id || q.actor_substr) {
+            bt_note(&bt, "Hint: filters are active (agent/project/session/actor/since/until); drop them to widen the search.\n");
+        }
+        send_rpc_tool_sc(w, req, &bt, sc);
         bt_destroy(&bt);
         return;
     }
-
     if (q.group_by_session) {
-        bt_printf_force(&bt, "Matched %u sessions (%u unique hits, %u duplicates folded, %.3f ms):\n\n",
-                        sr.session_group_count, sr.total_matches, sr.duplicates_folded, sr.elapsed_ms);
+        if (sr.session_group_count < sr.session_group_total) {
+            bt_printf_force(&bt, "Matched %u sessions, showing %u from offset %u (%u unique hits, %u duplicates folded, %.3f ms):\n\n",
+                            sr.session_group_total, sr.session_group_count, q.offset,
+                            sr.total_matches, sr.duplicates_folded, sr.elapsed_ms);
+        } else {
+            bt_printf_force(&bt, "Matched %u sessions (%u unique hits, %u duplicates folded, %.3f ms):\n\n",
+                            sr.session_group_total, sr.total_matches, sr.duplicates_folded, sr.elapsed_ms);
+        }
+        stelog_jw_kv_u64(sc, "total_sessions", sr.session_group_total);
+        stelog_jw_key(sc, "sessions");
+        stelog_jw_arr_begin(sc);
         char tbuf[32];
+        uint32_t shown = 0;
         for (uint32_t i = 0; i < sr.session_group_count; ++i) {
             const StelogSessionHit *g = &sr.session_groups[i];
             if (!bt_can_append(&bt, 160 + g->title.len + g->best_snippet.len, 3)) break;
             fmt_ts_iso(g->last_hit_ts_ms, tbuf, sizeof(tbuf));
-            uint32_t sid_s = g->session_id.len > 8 ? 8 : g->session_id.len;
+            uint32_t sid_s = short_sid_len(idx, g->session_id);
             bt_printf_force(&bt, "@%.*s [%-5s %s] (%u hits) | proj=%.*s | %.*s\n  best doc_id=%" PRIu64 ": ",
                             (int)sid_s, g->session_id.ptr,
                             stelog_agent_name(g->agent), tbuf, g->hit_count,
@@ -344,31 +535,64 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
                             g->best_doc_id);
             bt_append_sanitized(&bt, g->best_snippet.ptr, g->best_snippet.len);
             bt_append_raw(&bt, "\n\n", 2);
+            shown++;
+
+            stelog_jw_obj_begin(sc);
+            sc_kv_session(sc, "session", idx, g->session_id);
+            stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(g->agent));
+            sc_kv_ts(sc, "last_hit_ts", g->last_hit_ts_ms);
+            stelog_jw_kv_u64(sc, "hit_count", g->hit_count);
+            sc_kv_s(sc, "project", g->project);
+            sc_kv_s(sc, "title", g->title);
+            stelog_jw_kv_u64(sc, "best_doc_id", g->best_doc_id);
+            sc_kv_s(sc, "best_snippet", g->best_snippet);
+            stelog_jw_obj_end(sc);
+        }
+        stelog_jw_arr_end(sc);
+        stelog_jw_kv_u64(sc, "shown", shown);
+        if (q.offset + shown < sr.session_group_total) {
+            stelog_jw_kv_u64(sc, "next_offset", q.offset + shown);
+            bt_printf_force(&bt, "[more sessions: call search_history(..., group_by=\"session\", offset=%u)]\n", q.offset + shown);
         }
         bt_printf_force(&bt, "Next: call get_session_digest(session=\"@<id>\") to read the full decision stream of any session.\n");
-        send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+        send_rpc_tool_sc(w, req, &bt, sc);
         bt_destroy(&bt);
         return;
     }
 
     if (q.count_by != STELOG_COUNT_BY_NONE) {
         bt_printf_force(&bt, "Grouped counts (%u total matches, %u buckets, %.3f ms):\n", sr.total_matches, sr.bucket_count, sr.elapsed_ms);
+        stelog_jw_key(sc, "counts");
+        stelog_jw_arr_begin(sc);
         char tbuf[32];
+        uint32_t shown = 0;
         for (uint32_t i = 0; i < sr.bucket_count; ++i) {
-            if (!bt_can_append(&bt, sr.buckets[i].key.len + sr.buckets[i].meta_title.len + 64, 1)) break;
+            const StelogCountBucket *bk = &sr.buckets[i];
+            if (!bt_can_append(&bt, bk->key.len + bk->meta_title.len + 64, 1)) break;
+            shown++;
+            stelog_jw_obj_begin(sc);
+            stelog_jw_kv_u64(sc, "count", bk->count);
             if (q.count_by == STELOG_COUNT_BY_SESSION) {
-                fmt_ts_iso(sr.buckets[i].meta_last_ts_ms, tbuf, sizeof(tbuf));
-                uint32_t sid_s = sr.buckets[i].key.len > 8 ? 8 : sr.buckets[i].key.len;
+                fmt_ts_iso(bk->meta_last_ts_ms, tbuf, sizeof(tbuf));
+                uint32_t sid_s = short_sid_len(idx, bk->key);
                 bt_printf_force(&bt, "%6u  @%.*s [%-5s %s] %.*s\n",
-                                sr.buckets[i].count,
-                                (int)sid_s, sr.buckets[i].key.ptr,
-                                stelog_agent_name(sr.buckets[i].meta_agent), tbuf,
-                                (int)sr.buckets[i].meta_title.len, sr.buckets[i].meta_title.ptr);
+                                bk->count,
+                                (int)sid_s, bk->key.ptr,
+                                stelog_agent_name(bk->meta_agent), tbuf,
+                                (int)bk->meta_title.len, bk->meta_title.ptr);
+                sc_kv_session(sc, "key", idx, bk->key);
+                stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(bk->meta_agent));
+                sc_kv_ts(sc, "last_ts", bk->meta_last_ts_ms);
+                sc_kv_s(sc, "title", bk->meta_title);
             } else {
-                bt_printf_force(&bt, "%6u  %.*s\n", sr.buckets[i].count, (int)sr.buckets[i].key.len, sr.buckets[i].key.ptr);
+                bt_printf_force(&bt, "%6u  %.*s\n", bk->count, (int)bk->key.len, bk->key.ptr);
+                sc_kv_s(sc, "key", bk->key);
             }
+            stelog_jw_obj_end(sc);
         }
-        send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+        stelog_jw_arr_end(sc);
+        stelog_jw_kv_u64(sc, "shown", shown);
+        send_rpc_tool_sc(w, req, &bt, sc);
         bt_destroy(&bt);
         return;
     }
@@ -376,6 +600,8 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
     bt_printf_force(&bt, "Found %u matches (%.3f ms)%s:\n\n",
                     sr.total_matches, sr.elapsed_ms, is_timeline ? " [oldest-first timeline]" : "");
 
+    stelog_jw_key(sc, "hits");
+    stelog_jw_arr_begin(sc);
     uint32_t shown = 0;
     char tbuf[32];
     for (uint32_t i = 0; i < sr.count; ++i) {
@@ -383,7 +609,7 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
         size_t est = 160 + h->actor.len + h->project.len + h->snippet.len;
         if (!bt_can_append(&bt, est, 3)) break;
         fmt_ts_iso(h->ts_ms, tbuf, sizeof(tbuf));
-        uint32_t sid_short = h->session_id.len > 8 ? 8 : h->session_id.len;
+        uint32_t sid_short = short_sid_len(idx, h->session_id);
         bt_printf_force(&bt, "[%s] doc_id=%" PRIu64 " @%.*s | %s/%s | actor=%.*s | proj=%.*s\n  ",
                         tbuf, h->doc_id,
                         (int)sid_short, h->session_id.ptr,
@@ -394,9 +620,23 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
         bt_append_sanitized(&bt, h->snippet.ptr, h->snippet.len);
         bt_append_raw(&bt, "\n\n", 2);
         shown++;
+
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "doc_id", h->doc_id);
+        sc_kv_ts(sc, "ts", h->ts_ms);
+        sc_kv_session(sc, "session", idx, h->session_id);
+        stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(stelog_tag_agent(h->tag)));
+        stelog_jw_kv_cstr(sc, "role", stelog_role_name(stelog_tag_role(h->tag)));
+        sc_kv_s(sc, "actor", h->actor);
+        sc_kv_s(sc, "project", h->project);
+        sc_kv_s(sc, "snippet", h->snippet);
+        stelog_jw_obj_end(sc);
     }
+    stelog_jw_arr_end(sc);
+    stelog_jw_kv_u64(sc, "shown", shown);
 
     if (bt.truncated || sr.truncated) {
+        stelog_jw_kv_u64(sc, "next_offset", q.offset + shown);
         bt_printf_force(&bt, "[truncated by %s: showing %u/%u matches. Next: call %s(..., offset=%u), get_session_context(doc_id=...), or get_document(doc_id=...)]\n",
                         bt.truncated ? bt.truncated_by : "limit",
                         shown, sr.total_matches,
@@ -404,7 +644,7 @@ static void handle_search_tool(StelogIndex *idx, const StelogMcpRequest *req, bo
                         q.offset + shown);
     }
 
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
 
@@ -417,17 +657,27 @@ static void handle_context_tool(StelogIndex *idx, const StelogMcpRequest *req, S
     if (stelog_index_context(idx, req->arg_doc_id, req->arg_window ? req->arg_window : 5u,
                              req->arg_max_bytes ? req->arg_max_bytes : 1200u,
                              req->arg_include_tools, &cr) != 0) {
-        send_rpc_tool_text(w, req, "doc_id not found in index.", 26, true);
+        static const char kMsg[] = "doc_id not found in index. doc_ids are stable across rebuilds; use one returned by "
+                                   "search_history, get_session_digest, or search_file_history.";
+        send_rpc_tool_text(w, req, kMsg, sizeof(kMsg) - 1, true);
         return;
     }
 
     BoundedText bt;
     uint32_t text_budget = req->arg_max_bytes ? MCP_MAX_TEXT_BYTES : MCP_INLINE_SOFT_BYTES;
     bt_init(&bt, text_budget, MCP_MAX_TEXT_LINES);
+    StelogJsonWriter *sc = sc_begin();
     bt_printf_force(&bt, "Session %.*s | proj=%.*s | title=%.*s | %u turns (%.3f ms)\n\n",
                     (int)cr.session_id.len, cr.session_id.ptr,
                     (int)cr.project.len, cr.project.ptr,
                     (int)cr.title.len, cr.title.ptr, cr.count, cr.elapsed_ms);
+    sc_kv_session(sc, "session", idx, cr.session_id);
+    sc_kv_s(sc, "session_id", cr.session_id);
+    sc_kv_s(sc, "project", cr.project);
+    sc_kv_s(sc, "title", cr.title);
+    stelog_jw_kv_u64(sc, "anchor_doc_id", req->arg_doc_id);
+    stelog_jw_key(sc, "turns");
+    stelog_jw_arr_begin(sc);
 
     char tbuf[32];
     for (uint32_t i = 0; i < cr.count; ++i) {
@@ -444,11 +694,23 @@ static void handle_context_tool(StelogIndex *idx, const StelogMcpRequest *req, S
                         (int)h->actor.len, h->actor.ptr);
         bt_append_sanitized(&bt, h->snippet.ptr, h->snippet.len);
         bt_append_raw(&bt, "\n", 1);
+
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "doc_id", h->doc_id);
+        sc_kv_ts(sc, "ts", h->ts_ms);
+        stelog_jw_kv_cstr(sc, "role", stelog_role_name(stelog_tag_role(h->tag)));
+        sc_kv_s(sc, "actor", h->actor);
+        sc_kv_s(sc, "text", h->snippet);
+        if (h->truncated) stelog_jw_kv_bool(sc, "trimmed", true);
+        if (i == cr.anchor_index) stelog_jw_kv_bool(sc, "anchor", true);
+        if (h->collapsed_tools_before > 0) stelog_jw_kv_u64(sc, "tools_before", h->collapsed_tools_before);
+        stelog_jw_obj_end(sc);
     }
+    stelog_jw_arr_end(sc);
     if (bt.truncated) {
-        bt_printf_force(&bt, "[truncated by %s: use get_document(doc_id=...) to read any specific turn in full]\n", bt.truncated_by);
+        bt_note(&bt, "[truncated by %s: use get_document(doc_id=...) to read any specific turn in full]\n", bt.truncated_by);
     }
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
 
@@ -460,41 +722,146 @@ static void handle_digest_tool(StelogIndex *idx, const StelogMcpRequest *req, St
     uint32_t budget = req->arg_max_bytes ? req->arg_max_bytes : 7200u;
     if (budget > MCP_MAX_TEXT_BYTES - 1024u) budget = MCP_MAX_TEXT_BYTES - 1024u;
 
+    StelogDigestOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.session = req->arg_session.ptr;
+    opts.max_total_bytes = budget;
+    opts.turn_offset = req->arg_offset;
+    opts.include_tools = req->arg_include_tools;
+
     StelogDigestResult dr;
-    if (stelog_index_digest(idx, req->arg_session.ptr, budget, req->arg_include_tools, &dr) != 0) {
-        send_rpc_tool_text(w, req, "Session not found.", 18, true);
+    int rc = stelog_index_digest_ex(idx, &opts, &dr);
+    BoundedText bt;
+    char tbuf[32], tbuf2[32];
+    if (rc == -1) {
+        char msg[256];
+        int n = snprintf(msg, sizeof(msg),
+                         "No session matches \"%.*s\". Use list_sessions or search_history(group_by=\"session\") to find a session id.",
+                         (int)(req->arg_session.len > 80 ? 80 : req->arg_session.len), req->arg_session.ptr);
+        send_rpc_tool_text(w, req, msg, (size_t)(n > 0 ? n : 0), true);
+        return;
+    }
+    if (rc == -2) {
+        bt_init(&bt, MCP_INLINE_SOFT_BYTES, MCP_MAX_TEXT_LINES);
+        bt_printf_force(&bt, "Ambiguous session prefix \"%.*s\": %u sessions match. Retry with a longer prefix:\n",
+                        (int)(req->arg_session.len > 80 ? 80 : req->arg_session.len), req->arg_session.ptr, dr.match_count);
+        for (uint32_t i = 0; i < dr.candidate_count; ++i) {
+            const StelogSessionSummary *c = &dr.candidates[i];
+            fmt_ts_iso(c->first_ts_ms, tbuf, sizeof(tbuf));
+            fmt_ts_iso(c->last_ts_ms, tbuf2, sizeof(tbuf2));
+            uint32_t sl = short_sid_len(idx, c->session_id);
+            bt_printf_force(&bt, "  @%.*s [%s %s .. %s] %u docs | proj=%.*s | %.*s\n",
+                            (int)sl, c->session_id.ptr, stelog_agent_name(c->agent), tbuf, tbuf2, c->doc_count,
+                            (int)c->project.len, c->project.ptr, (int)(c->title.len > 120 ? 120 : c->title.len), c->title.ptr);
+        }
+        if (dr.match_count > dr.candidate_count) {
+            bt_printf_force(&bt, "  ... and %u more\n", dr.match_count - dr.candidate_count);
+        }
+        send_rpc_tool_text(w, req, bt.buf, bt.len, true);
+        bt_destroy(&bt);
+        return;
+    }
+    if (rc != 0) {
+        send_rpc_tool_text(w, req, "Digest failed.", 14, true);
         return;
     }
 
-    BoundedText bt;
-    uint32_t text_budget = req->arg_max_bytes ? MCP_MAX_TEXT_BYTES : (MCP_INLINE_SOFT_BYTES + 200u);
+    uint32_t text_budget = req->arg_max_bytes ? MCP_MAX_TEXT_BYTES : (MCP_INLINE_SOFT_BYTES + 400u);
     bt_init(&bt, text_budget, MCP_MAX_TEXT_LINES);
-    bt_printf_force(&bt, "Digest @%.*s [%s] | proj=%.*s | %u/%u dialogue turns (%u tools collapsed, %u retries deduped, %.3f ms)\n\n",
-                    (int)dr.session_id.len, dr.session_id.ptr,
-                    stelog_agent_name(dr.agent),
+    StelogJsonWriter *sc = sc_begin();
+    fmt_ts_iso(dr.first_ts_ms, tbuf, sizeof(tbuf));
+    fmt_ts_iso(dr.last_ts_ms, tbuf2, sizeof(tbuf2));
+    uint32_t sl = short_sid_len(idx, dr.session_id);
+    bt_printf_force(&bt, "Digest @%.*s [%s] %s .. %s | proj=%.*s | title=%.*s\n",
+                    (int)sl, dr.session_id.ptr, stelog_agent_name(dr.agent), tbuf, tbuf2,
                     (int)dr.project.len, dr.project.ptr,
+                    (int)(dr.title.len > 160 ? 160 : dr.title.len), dr.title.ptr);
+    sc_kv_session(sc, "session", idx, dr.session_id);
+    sc_kv_s(sc, "session_id", dr.session_id);
+    stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(dr.agent));
+    sc_kv_ts(sc, "first_ts", dr.first_ts_ms);
+    sc_kv_ts(sc, "last_ts", dr.last_ts_ms);
+    sc_kv_s(sc, "project", dr.project);
+    sc_kv_s(sc, "title", dr.title);
+    stelog_jw_kv_u64(sc, "total_turns", dr.total_dialogue_turns);
+    stelog_jw_kv_u64(sc, "tools_collapsed", dr.total_tools_collapsed);
+    stelog_jw_kv_u64(sc, "duplicates_skipped", dr.duplicates_skipped);
+    stelog_jw_key(sc, "turns");
+    stelog_jw_arr_begin(sc);
+    if (dr.count == 0) {
+        stelog_jw_arr_end(sc);
+        bt_printf_force(&bt, "No dialogue turns at offset %u (session has %u turns, %u tool records collapsed).\n",
+                        dr.turn_offset, dr.total_dialogue_turns, dr.total_tools_collapsed);
+        send_rpc_tool_sc(w, req, &bt, sc);
+        bt_destroy(&bt);
+        return;
+    }
+    bt_printf_force(&bt, "Showing %u of %u dialogue turns%s (%u tool records collapsed, %u retries deduped, %.3f ms)\n\n",
                     dr.count, dr.total_dialogue_turns,
+                    dr.omitted_count ? "" : (dr.turn_offset ? " (through the end)" : " (complete)"),
                     dr.total_tools_collapsed, dr.duplicates_skipped, dr.elapsed_ms);
 
-    char tbuf[32];
+    uint32_t shown = 0;
     for (uint32_t i = 0; i < dr.count; ++i) {
         const StelogHit *h = &dr.items[i];
-        if (!bt_can_append(&bt, 120 + h->snippet.len, 3)) break;
+        bool after_gap = dr.omitted_count > 0 && i >= dr.gap_item_index;
+        if (dr.omitted_count > 0 && i == dr.gap_item_index) {
+            bt_printf_force(&bt, "  [... %u turns omitted (#%u-#%u); call get_session_digest(session=\"@%.*s\", offset=%u) to read them]\n",
+                            dr.omitted_count, dr.omitted_begin, dr.omitted_begin + dr.omitted_count - 1u,
+                            (int)sl, dr.session_id.ptr, dr.next_offset);
+        }
+        if (!bt_can_append(&bt, 140 + h->snippet.len, 3)) break;
+        uint32_t turn_no = after_gap ? dr.omitted_begin + dr.omitted_count + (i - dr.gap_item_index) : dr.turn_offset + i;
         if (h->collapsed_tools_before > 0) {
             bt_printf_force(&bt, "  [...%u tool calls]\n", h->collapsed_tools_before);
         }
         fmt_ts_iso(h->ts_ms, tbuf, sizeof(tbuf));
-        bt_printf_force(&bt, "[%s] doc_id=%" PRIu64 " %s (%.*s): ",
-                        tbuf, h->doc_id,
+        bt_printf_force(&bt, "#%u [%s] doc_id=%" PRIu64 " %s (%.*s): ",
+                        turn_no, tbuf, h->doc_id,
                         stelog_role_name(stelog_tag_role(h->tag)),
                         (int)h->actor.len, h->actor.ptr);
         bt_append_sanitized(&bt, h->snippet.ptr, h->snippet.len);
         bt_append_raw(&bt, "\n", 1);
+        shown++;
+
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "turn", turn_no);
+        stelog_jw_kv_u64(sc, "doc_id", h->doc_id);
+        sc_kv_ts(sc, "ts", h->ts_ms);
+        stelog_jw_kv_cstr(sc, "role", stelog_role_name(stelog_tag_role(h->tag)));
+        sc_kv_s(sc, "actor", h->actor);
+        sc_kv_s(sc, "text", h->snippet);
+        if (h->truncated) stelog_jw_kv_bool(sc, "trimmed", true);
+        if (h->collapsed_tools_before > 0) stelog_jw_kv_u64(sc, "tools_before", h->collapsed_tools_before);
+        stelog_jw_obj_end(sc);
     }
-    if (dr.truncated || bt.truncated) {
-        bt_printf_force(&bt, "\n[truncated: call get_document(doc_id=...) to expand any specific turn]\n");
+    stelog_jw_arr_end(sc);
+    if (dr.omitted_count > 0) {
+        stelog_jw_key(sc, "omitted");
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "from_turn", dr.omitted_begin);
+        stelog_jw_kv_u64(sc, "to_turn", dr.omitted_begin + dr.omitted_count - 1u);
+        stelog_jw_kv_u64(sc, "next_offset", dr.next_offset);
+        stelog_jw_obj_end(sc);
     }
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    if (dr.omitted_count > 0 && dr.gap_item_index >= dr.count && shown == dr.count) {
+        bt_printf_force(&bt, "\n[... %u more turns (#%u-#%u); call get_session_digest(session=\"@%.*s\", offset=%u) to continue]\n",
+                        dr.omitted_count, dr.omitted_begin, dr.omitted_begin + dr.omitted_count - 1u,
+                        (int)sl, dr.session_id.ptr, dr.next_offset);
+    }
+    if (bt.truncated) {
+        bool in_head = dr.omitted_count == 0 || shown < dr.gap_item_index;
+        uint32_t next = in_head ? dr.turn_offset + shown
+                                : dr.omitted_begin + dr.omitted_count + (shown - dr.gap_item_index);
+        /* structuredContent.next_offset is the earliest unread turn, so paging from it reads everything */
+        stelog_jw_kv_u64(sc, "next_offset", (dr.omitted_count > 0 && dr.next_offset < next) ? dr.next_offset : next);
+        bt_printf_force(&bt, "\n[output budget reached after %u items; call get_session_digest(session=\"@%.*s\", offset=%u) or get_document(doc_id=...)]\n",
+                        shown, (int)sl, dr.session_id.ptr, next);
+    } else if (dr.omitted_count > 0) {
+        stelog_jw_kv_u64(sc, "next_offset", dr.next_offset);
+    }
+    bt_printf_force(&bt, "\n[long turns are trimmed; call get_document(doc_ids=[...]) to read any turn in full]\n");
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
 
@@ -525,7 +892,11 @@ static void handle_get_doc_tool(StelogIndex *idx, const StelogMcpRequest *req, S
 
     BoundedText bt;
     bt_init(&bt, MCP_MAX_TEXT_BYTES, MCP_MAX_TEXT_LINES * 4u);
+    StelogJsonWriter *sc = sc_begin();
+    stelog_jw_key(sc, "documents");
+    stelog_jw_arr_begin(sc);
     char tbuf[32];
+    uint32_t done = id_count;
 
     for (uint32_t i = 0; i < id_count; ++i) {
         if (i > 0) bt_append_raw(&bt, "\n", 1);
@@ -533,6 +904,7 @@ static void handle_get_doc_tool(StelogIndex *idx, const StelogMcpRequest *req, S
         if (rem_bt < 256u) {
             bt_printf_force(&bt, "[batch budget reached after %u/%u docs; fetch remaining doc_ids in another call]\n",
                             i, id_count);
+            done = i;
             break;
         }
         uint32_t this_lim = per_doc_lim < (uint32_t)rem_bt ? per_doc_lim : (uint32_t)rem_bt;
@@ -542,10 +914,16 @@ static void handle_get_doc_tool(StelogIndex *idx, const StelogMcpRequest *req, S
         if (stelog_index_get_document(idx, ids[i], req->arg_raw, this_off, this_lim, req->arg_tail, &dr) != 0) {
             if (id_count == 1) {
                 bt_destroy(&bt);
-                send_rpc_tool_text(w, req, "Failed to read document (invalid doc_id or compressed raw file).", 63, true);
+                static const char kMsg[] = "Failed to read document (unknown doc_id or compressed raw file). doc_ids are stable "
+                                           "across rebuilds; use one returned by search_history, get_session_digest, or search_file_history.";
+                send_rpc_tool_text(w, req, kMsg, sizeof(kMsg) - 1, true);
                 return;
             }
             bt_printf_force(&bt, "doc_id=%" PRIu64 " | ERROR: not found or compressed raw file\n", ids[i]);
+            stelog_jw_obj_begin(sc);
+            stelog_jw_kv_u64(sc, "doc_id", ids[i]);
+            stelog_jw_kv_cstr(sc, "error", "not found or compressed raw file");
+            stelog_jw_obj_end(sc);
             continue;
         }
 
@@ -569,24 +947,51 @@ static void handle_get_doc_tool(StelogIndex *idx, const StelogMcpRequest *req, S
         }
         bt_append_raw(&bt, dr.content.ptr, dr.content.len);
         bt_append_raw(&bt, "\n", 1);
+
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "doc_id", dr.doc_id);
+        sc_kv_ts(sc, "ts", dr.ts_ms);
+        sc_kv_session(sc, "session", idx, dr.session_id);
+        stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(stelog_tag_agent(dr.tag)));
+        stelog_jw_kv_cstr(sc, "role", stelog_role_name(stelog_tag_role(dr.tag)));
+        sc_kv_s(sc, "actor", dr.actor);
+        sc_kv_s(sc, "project", dr.project);
+        stelog_jw_kv_u64(sc, "offset", dr.returned_offset);
+        stelog_jw_kv_u64(sc, "total_bytes", dr.total_bytes);
+        stelog_jw_kv_str(sc, "content", dr.content.ptr ? dr.content.ptr : "", dr.content.len);
         if (dr.truncated) {
             uint32_t next_off = dr.returned_offset + dr.content.len;
             uint32_t rem_bytes = dr.total_bytes > next_off ? (dr.total_bytes - next_off) : 0u;
             bt_printf_force(&bt, "---\n[truncated: next call get_document(doc_id=%" PRIu64 ", offset=%u) for remaining %uB]\n",
                             dr.doc_id, next_off, rem_bytes);
+            if (rem_bytes > 0) stelog_jw_kv_u64(sc, "next_offset", next_off);
         }
+        stelog_jw_obj_end(sc);
     }
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    stelog_jw_arr_end(sc);
+    if (done < id_count) {
+        stelog_jw_key(sc, "remaining_doc_ids");
+        stelog_jw_arr_begin(sc);
+        for (uint32_t i = done; i < id_count; ++i) stelog_jw_u64(sc, ids[i]);
+        stelog_jw_arr_end(sc);
+    }
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
 
 static void handle_sessions_tool(StelogIndex *idx, const StelogMcpRequest *req, StelogJsonWriter *w) {
+    int64_t since_ms, until_ms;
+    char time_err[320];
+    if (!parse_time_range(req, &since_ms, &until_ms, time_err, sizeof(time_err))) {
+        send_rpc_tool_text(w, req, time_err, strlen(time_err), true);
+        return;
+    }
     StelogSessionListResult sl;
     stelog_index_list_sessions(idx,
                                parse_agent_csv(req->arg_agent),
                                req->arg_project.len ? req->arg_project.ptr : NULL,
-                               parse_time_arg(req->arg_since),
-                               parse_time_arg(req->arg_until),
+                               since_ms,
+                               until_ms,
                                req->arg_limit ? req->arg_limit : 20u,
                                req->arg_offset,
                                &sl);
@@ -594,31 +999,65 @@ static void handle_sessions_tool(StelogIndex *idx, const StelogMcpRequest *req, 
     BoundedText bt;
     uint32_t text_budget = (req->arg_limit > 20u) ? MCP_MAX_TEXT_BYTES : MCP_INLINE_SOFT_BYTES;
     bt_init(&bt, text_budget, MCP_MAX_TEXT_LINES);
-    bt_printf_force(&bt, "Sessions: %u total (showing %u, %.3f ms)\n\n", sl.total_matches, sl.count, sl.elapsed_ms);
-    char tbuf[32];
+    StelogJsonWriter *sc = sc_begin();
+    stelog_jw_kv_u64(sc, "total", sl.total_matches);
+    stelog_jw_key(sc, "sessions");
+    stelog_jw_arr_begin(sc);
+    bt_printf_force(&bt, "Sessions: %u total (showing %u from offset %u, %.3f ms; times are first .. last activity)\n\n",
+                    sl.total_matches, sl.count, req->arg_offset, sl.elapsed_ms);
+    char tbuf[32], tbuf2[32];
+    uint32_t shown = 0;
     for (uint32_t i = 0; i < sl.count; ++i) {
         const StelogSessionSummary *s = &sl.items[i];
-        if (!bt_can_append(&bt, 128 + s->project.len + s->title.len, 1)) break;
-        fmt_ts_iso(s->last_ts_ms, tbuf, sizeof(tbuf));
-        bt_printf_force(&bt, "[%s] %-5s %4u docs | @%.*s | proj=%.*s | %.*s\n",
-                        tbuf, stelog_agent_name(s->agent), s->doc_count,
-                        (int)s->session_id.len, s->session_id.ptr,
+        if (!bt_can_append(&bt, 160 + s->project.len + s->title.len, 1)) break;
+        shown++;
+        fmt_ts_iso(s->first_ts_ms, tbuf, sizeof(tbuf));
+        fmt_ts_iso(s->last_ts_ms, tbuf2, sizeof(tbuf2));
+        uint32_t sl_len = short_sid_len(idx, s->session_id);
+        bool sub = (s->flags & STELOG_FLAG_IS_SUBAGENT) != 0;
+        bt_printf_force(&bt, "[%s .. %s] %-5s %4u docs | @%.*s%s | proj=%.*s | %.*s\n",
+                        tbuf, tbuf2, stelog_agent_name(s->agent), s->doc_count,
+                        (int)sl_len, s->session_id.ptr,
+                        sub ? " (subagent)" : "",
                         (int)s->project.len, s->project.ptr,
                         (int)s->title.len, s->title.ptr);
+
+        stelog_jw_obj_begin(sc);
+        sc_kv_session(sc, "session", idx, s->session_id);
+        sc_kv_s(sc, "session_id", s->session_id);
+        stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(s->agent));
+        sc_kv_ts(sc, "first_ts", s->first_ts_ms);
+        sc_kv_ts(sc, "last_ts", s->last_ts_ms);
+        stelog_jw_kv_u64(sc, "doc_count", s->doc_count);
+        if (sub) stelog_jw_kv_bool(sc, "subagent", true);
+        sc_kv_s(sc, "project", s->project);
+        sc_kv_s(sc, "title", s->title);
+        stelog_jw_obj_end(sc);
     }
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    stelog_jw_arr_end(sc);
+    if (req->arg_offset + shown < sl.total_matches) {
+        stelog_jw_kv_u64(sc, "next_offset", req->arg_offset + shown);
+        bt_printf_force(&bt, "\n[more: call list_sessions(..., offset=%u)]\n", req->arg_offset + shown);
+    }
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
 
 static void handle_files_tool(StelogIndex *idx, const StelogMcpRequest *req, StelogJsonWriter *w) {
+    int64_t since_ms, until_ms;
+    char time_err[320];
+    if (!parse_time_range(req, &since_ms, &until_ms, time_err, sizeof(time_err))) {
+        send_rpc_tool_text(w, req, time_err, strlen(time_err), true);
+        return;
+    }
     StelogFileHistoryResult fh;
     stelog_index_files(idx,
                        req->arg_file.len ? req->arg_file.ptr : NULL,
                        parse_agent_csv(req->arg_agent),
                        req->arg_project.len ? req->arg_project.ptr : NULL,
                        req->arg_session.len ? req->arg_session.ptr : NULL,
-                       parse_time_arg(req->arg_since),
-                       parse_time_arg(req->arg_until),
+                       since_ms,
+                       until_ms,
                        req->arg_no_subagents,
                        req->arg_limit ? req->arg_limit : 30u,
                        req->arg_offset,
@@ -627,27 +1066,49 @@ static void handle_files_tool(StelogIndex *idx, const StelogMcpRequest *req, Ste
     BoundedText bt;
     uint32_t text_budget = (req->arg_limit > 20u) ? MCP_MAX_TEXT_BYTES : MCP_INLINE_SOFT_BYTES;
     bt_init(&bt, text_budget, MCP_MAX_TEXT_LINES);
+    StelogJsonWriter *sc = sc_begin();
+    stelog_jw_kv_u64(sc, "total_matches", fh.total_matches);
+    stelog_jw_key(sc, "touches");
+    stelog_jw_arr_begin(sc);
     bt_printf_force(&bt, "File modifications: %u matches (showing %u, %.3f ms)\n\n", fh.total_matches, fh.count, fh.elapsed_ms);
     char tbuf[32];
+    uint32_t shown = 0;
     for (uint32_t i = 0; i < fh.count; ++i) {
         const StelogFileTouch *ft = &fh.items[i];
         if (!bt_can_append(&bt, 140 + ft->file_touched.len + ft->project.len, 1)) break;
+        shown++;
         fmt_ts_iso(ft->ts_ms, tbuf, sizeof(tbuf));
-        uint32_t sid_s = ft->session_id.len > 8 ? 8 : ft->session_id.len;
+        uint32_t sid_s = short_sid_len(idx, ft->session_id);
         bt_printf_force(&bt, "[%s] doc_id=%" PRIu64 " @%.*s | %-5s | %-10.*s | actor=%.*s | %.*s\n",
                         tbuf, ft->doc_id, (int)sid_s, ft->session_id.ptr,
                         stelog_agent_name(stelog_tag_agent(ft->tag)),
                         (int)ft->tool_name.len, ft->tool_name.ptr,
                         (int)ft->actor.len, ft->actor.ptr,
                         (int)ft->file_touched.len, ft->file_touched.ptr);
+
+        stelog_jw_obj_begin(sc);
+        stelog_jw_kv_u64(sc, "doc_id", ft->doc_id);
+        sc_kv_ts(sc, "ts", ft->ts_ms);
+        sc_kv_session(sc, "session", idx, ft->session_id);
+        stelog_jw_kv_cstr(sc, "agent", stelog_agent_name(stelog_tag_agent(ft->tag)));
+        sc_kv_s(sc, "tool", ft->tool_name);
+        sc_kv_s(sc, "actor", ft->actor);
+        sc_kv_s(sc, "file", ft->file_touched);
+        stelog_jw_obj_end(sc);
     }
+    stelog_jw_arr_end(sc);
+    stelog_jw_kv_u64(sc, "shown", shown);
     if (fh.truncated || bt.truncated) {
-        bt_printf_force(&bt, "[truncated: use get_session_context(doc_id=...) to inspect the decision behind any file edit]\n");
+        stelog_jw_kv_u64(sc, "next_offset", req->arg_offset + shown);
+        bt_printf_force(&bt, "\n[truncated by %s: showing %u/%u matches. Next: call search_file_history(..., offset=%u) for more, "
+                             "or get_session_context(doc_id=...) to inspect the decision behind an edit]\n",
+                        bt.truncated ? bt.truncated_by : "limit", shown, fh.total_matches, req->arg_offset + shown);
+    } else if (fh.count > 0) {
+        bt_printf_force(&bt, "\n[use get_session_context(doc_id=...) to inspect the decision behind an edit]\n");
     }
-    send_rpc_tool_text(w, req, bt.buf, bt.len, false);
+    send_rpc_tool_sc(w, req, &bt, sc);
     bt_destroy(&bt);
 }
-
 /* ============================================================================
  * Main stdio JSON-RPC 2.0 Loop
  * ============================================================================ */
@@ -670,6 +1131,8 @@ int stelog_mcp_serve(const char *index_dir) {
     stelog_arena_init(&req_arena, 64u * 1024u);
     StelogJsonWriter jw;
     stelog_jw_init(&jw, 65536u);
+    stelog_jw_init(&g_sc, 65536u);
+    stelog_jw_init(&g_notes, 1024u);
 
     double last_sync_ms = stelog_now_ms();
     char *line = NULL;
@@ -705,9 +1168,10 @@ int stelog_mcp_serve(const char *index_dir) {
             stelog_jw_reset(&jw);
             stelog_jw_obj_begin(&jw);
             stelog_jw_kv_cstr(&jw, "jsonrpc", "2.0");
+            g_structured_output = client_wants_structured(req.client_name);
             write_rpc_id(&jw, &req);
             stelog_jw_key(&jw, "result");
-            stelog_jw_raw(&jw, stelog_mcp_initialize_json, stelog_mcp_initialize_json_len);
+            write_initialize_result(&jw, req.protocol_version);
             stelog_jw_obj_end(&jw);
             fwrite(jw.buf, 1, jw.len, stdout);
             fputc('\n', stdout);
@@ -730,7 +1194,8 @@ int stelog_mcp_serve(const char *index_dir) {
             stelog_jw_kv_cstr(&jw, "jsonrpc", "2.0");
             write_rpc_id(&jw, &req);
             stelog_jw_key(&jw, "result");
-            stelog_jw_raw(&jw, stelog_mcp_tools_list_json, stelog_mcp_tools_list_json_len);
+            if (g_structured_output) stelog_jw_raw(&jw, stelog_mcp_tools_list_json, stelog_mcp_tools_list_json_len);
+            else stelog_jw_raw(&jw, stelog_mcp_tools_list_plain_json, stelog_mcp_tools_list_plain_json_len);
             stelog_jw_obj_end(&jw);
             fwrite(jw.buf, 1, jw.len, stdout);
             fputc('\n', stdout);
@@ -767,6 +1232,8 @@ int stelog_mcp_serve(const char *index_dir) {
     }
 
     free(line);
+    stelog_jw_destroy(&g_notes);
+    stelog_jw_destroy(&g_sc);
     stelog_jw_destroy(&jw);
     stelog_arena_destroy(&req_arena);
     stelog_json_parser_destroy(jp);

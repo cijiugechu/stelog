@@ -25,6 +25,7 @@ const char *stelog_agent_name(StelogAgentKind kind) {
         case STELOG_AGENT_CODEX: return "codex";
         case STELOG_AGENT_AGY:   return "agy";
         case STELOG_AGENT_PI:    return "pi";
+        case STELOG_AGENT_DROID: return "droid";
         default:                 return "unknown";
     }
 }
@@ -251,6 +252,8 @@ static bool should_skip_line(StelogAgentKind agent,
             return stelog_agy_should_skip_line(line, len, opts->include_tool_results, opts->include_system);
         case STELOG_AGENT_PI:
             return stelog_pi_should_skip_line(line, len, opts->include_tool_results);
+        case STELOG_AGENT_DROID:
+            return stelog_droid_should_skip_line(line, len, opts->include_tool_results);
         default:
             return true;
     }
@@ -332,6 +335,11 @@ static void parse_and_record_line(SharedScanState *S,
             rc = stelog_json_parse_pi_line(W->json, line, line_len, padded_cap,
                                            f->file_id, raw_offset, &S->parse_opts,
                                            ctx, &W->line_arena, &res);
+            break;
+        case STELOG_AGENT_DROID:
+            rc = stelog_json_parse_droid_line(W->json, line, line_len, padded_cap,
+                                              f->file_id, raw_offset, &S->parse_opts,
+                                              ctx, &W->line_arena, &res);
             break;
         default:
             return;
@@ -674,10 +682,11 @@ int stelog_run_scan(const StelogScanConfig *cfg,
 
     double t_start = stelog_now_ms();
     const char *home = getenv("HOME");
-    char codex_dir[1024], agy_dir[1024], pi_dir[1024];
+    char codex_dir[1024], agy_dir[1024], pi_dir[1024], droid_dir[1024];
     resolve_default_path(cfg->codex_home, home, ".codex", codex_dir, sizeof(codex_dir));
     resolve_default_path(cfg->agy_home, home, ".gemini/antigravity-cli", agy_dir, sizeof(agy_dir));
     resolve_default_path(cfg->pi_home, home, ".pi/agent", pi_dir, sizeof(pi_dir));
+    resolve_default_path(cfg->droid_home, home, ".factory", droid_dir, sizeof(droid_dir));
 
     uint32_t mask = cfg->agent_mask ? cfg->agent_mask : ((1u << STELOG_AGENT_COUNT) - 1u);
 
@@ -687,6 +696,7 @@ int stelog_run_scan(const StelogScanConfig *cfg,
     if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_discover(codex_dir, &files);
     if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_discover(agy_dir, &files);
     if (mask & (1u << STELOG_AGENT_PI))    stelog_pi_discover(pi_dir, &files);
+    if (mask & (1u << STELOG_AGENT_DROID)) stelog_droid_discover(droid_dir, &files);
     double t_disc = stelog_now_ms();
 
     /* 2. Load SQLite session metadata */

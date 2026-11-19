@@ -412,6 +412,43 @@ bool stelog_pi_should_skip_line(const char *line, size_t line_len,
     return false;
 }
 
+static bool mem_contains(const char *hay, size_t hay_len, const char *needle) {
+    size_t nl = strlen(needle);
+    if (nl == 0 || hay_len < nl) return false;
+    const char *end = hay + hay_len - nl;
+    for (const char *p = hay; p <= end; ) {
+        const char *hit = (const char *)memchr(p, needle[0], (size_t)(end - p) + 1);
+        if (!hit) return false;
+        if (memcmp(hit, needle, nl) == 0) return true;
+        p = hit + 1;
+    }
+    return false;
+}
+
+bool stelog_droid_should_skip_line(const char *line, size_t line_len,
+                                   bool include_tool_results) {
+    if (line_len < 12) return true;
+    size_t scan_len = line_len < 220 ? line_len : 220;
+
+    const char *top_type = NULL;
+    size_t top_len = 0;
+    if (!extract_prefix_string_field(line, scan_len, "\"type\"", 6, &top_type, &top_len)) {
+        return false;
+    }
+    if (str_eq(top_type, top_len, "todo_state") ||
+        str_eq(top_type, top_len, "agent_turn_outcome") ||
+        str_eq(top_type, top_len, "compaction_state")) {
+        return true;
+    }
+    /* Pure tool-result turns are the bulk of a Droid transcript; drop them before simdjson unless
+       requested, but keep any line that also carries a text block (user typed alongside results). */
+    if (!include_tool_results && str_eq(top_type, top_len, "message") &&
+        mem_contains(line, scan_len + 64 < line_len ? scan_len + 64 : line_len, "\"type\":\"tool_result\"") &&
+        !mem_contains(line, line_len, "\"type\":\"text\"")) {
+        return true;
+    }
+    return false;
+}
 /* UTF-8 continuation byte check: 10xxxxxx */
 static inline bool utf8_is_cont(uint8_t b) {
     return (b & 0xC0u) == 0x80u;

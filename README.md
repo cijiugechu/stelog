@@ -1,6 +1,6 @@
 # stelog
 
-Ultra-fast local history search and decision archaeology across coding agents (**Codex CLI**, **AGY CLI**, and **Pi**).
+Ultra-fast local history search and decision archaeology across coding agents (**Codex CLI**, **AGY CLI**, **Pi**, and **Factory Droid**).
 
 One **2.8 MB** static binary provides both a `ripgrep`-inspired CLI and a stdio **MCP Server** (`stelog mcp`) backed by a Data-Oriented `mmap` index — microsecond queries, automatic Hot Delta refresh, no background daemon.
 
@@ -17,6 +17,7 @@ One **2.8 MB** static binary provides both a `ripgrep`-inspired CLI and a stdio 
 | **Codex CLI** | `~/.codex/sessions/**/*.jsonl(.zst)`, `archived_sessions/`, `state_5.sqlite` |
 | **AGY CLI** | `~/.gemini/antigravity-cli/brain/*/.system_generated/logs/transcript.jsonl`, `conversation_summaries.db` |
 | **Pi** | `~/.pi/agent/sessions/**/*.jsonl` |
+| **Factory Droid** | `~/.factory/sessions/<cwd-slug>/<session-id>.jsonl` |
 
 ## Build & Install
 

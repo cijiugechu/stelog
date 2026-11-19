@@ -53,6 +53,7 @@ static uint32_t parse_mod_agent_csv(StelogStr s) {
         if (l == 5 && memcmp(p, "codex", 5) == 0) mask |= (1u << STELOG_AGENT_CODEX);
         else if (l == 3 && memcmp(p, "agy", 3) == 0) mask |= (1u << STELOG_AGENT_AGY);
         else if (l == 2 && memcmp(p, "pi", 2) == 0) mask |= (1u << STELOG_AGENT_PI);
+        else if (l == 5 && memcmp(p, "droid", 5) == 0) mask |= (1u << STELOG_AGENT_DROID);
         if (!c) break;
         p = c + 1;
     }
@@ -80,24 +81,11 @@ static uint32_t parse_mod_role_csv(StelogStr s) {
     return mask;
 }
 
-static int64_t parse_mod_time_ms(StelogStr s) {
-    if (!s.ptr || s.len == 0) return 0;
-    if (s.len >= 2 && (s.ptr[s.len - 1] == 'd' || s.ptr[s.len - 1] == 'h')) {
-        char buf[32];
-        size_t copy = s.len < sizeof(buf) - 1 ? s.len : sizeof(buf) - 1;
-        memcpy(buf, s.ptr, copy);
-        buf[copy] = '\0';
-        char *end = NULL;
-        long val = strtol(buf, &end, 10);
-        if (end == buf + copy - 1 && val > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t now_ms = (int64_t)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000ll;
-            int64_t d = (buf[copy - 1] == 'd') ? (val * 86400ll * 1000ll) : (val * 3600ll * 1000ll);
-            return now_ms - d;
-        }
-    }
-    return stelog_parse_iso8601_ms(s.ptr, s.len);
+/* Returns false when a non-empty inline since:/until: value cannot be parsed. */
+static bool parse_mod_time_ms(StelogStr s, bool end_of_range, int64_t *out_ms) {
+    *out_ms = 0;
+    if (!s.ptr || s.len == 0) return true;
+    return stelog_parse_time_arg(s.ptr, s.len, end_of_range, out_ms);
 }
 
 /* Extract a UTF-8 safe snippet: centers around any matched branch keyword or regex span when found deep in text;
@@ -1096,6 +1084,9 @@ static void query_one_segment(const StelogIndex *idx,
 
         float idf_val = use_bhits ? bhits[i].idf : single_idf;
         float dl = (float)(seg->col_text_len[d] ? seg->col_text_len[d] : 1u);
+        /* Tool calls are short by construction (name + capped args), so BM25's short-document boost would
+           otherwise rank a bare "Read: path" above the discussion that explains the decision. */
+        if (rk == STELOG_ROLE_TOOL_CALL && dl < avg_dl) dl = avg_dl;
         float len_norm = (k1 + 1.0f) / (k1_one_minus_b + k1_b_inv_avg * dl);
         float rw = role_decision_weight(rk);
         float recency = 1.0f;
@@ -1323,6 +1314,66 @@ static uint32_t dedup_candidates(const StelogIndex *idx, CandList *cands, Stelog
     return folded;
 }
 
+/* Arena-backed open-addressing map from string key to a dense u32 index (grows at 50% load). */
+typedef struct {
+    uint64_t hash;
+    StelogStr key;
+    uint32_t val;
+    uint32_t used;
+} StrMapSlot;
+
+typedef struct {
+    StrMapSlot *slots;
+    uint32_t mask;
+    uint32_t count;
+    StelogArena *arena;
+} StrMap;
+
+static void strmap_init(StrMap *m, StelogArena *arena, uint32_t initial) {
+    uint32_t cap = 64;
+    while (cap < initial * 2u && cap < (1u << 30)) cap <<= 1u;
+    m->arena = arena;
+    m->slots = (StrMapSlot *)stelog_arena_alloc_aligned(arena, cap * sizeof(StrMapSlot), 8);
+    memset(m->slots, 0, cap * sizeof(StrMapSlot));
+    m->mask = cap - 1u;
+    m->count = 0;
+}
+
+static void strmap_grow(StrMap *m) {
+    uint32_t old_cap = m->mask + 1u;
+    uint32_t cap = old_cap * 2u;
+    StrMapSlot *ns = (StrMapSlot *)stelog_arena_alloc_aligned(m->arena, cap * sizeof(StrMapSlot), 8);
+    memset(ns, 0, cap * sizeof(StrMapSlot));
+    uint32_t mask = cap - 1u;
+    for (uint32_t i = 0; i < old_cap; ++i) {
+        if (!m->slots[i].used) continue;
+        uint32_t pos = (uint32_t)m->slots[i].hash & mask;
+        while (ns[pos].used) pos = (pos + 1u) & mask;
+        ns[pos] = m->slots[i];
+    }
+    m->slots = ns;
+    m->mask = mask;
+}
+
+/* Returns the existing value for key, or inserts new_val and sets *inserted. */
+static uint32_t strmap_get_or_put(StrMap *m, StelogStr key, uint32_t new_val, bool *inserted) {
+    if ((m->count + 1u) * 2u > m->mask + 1u) strmap_grow(m);
+    uint64_t h = stelog_wyhash(key.ptr, key.len, 0x9e3779b97f4a7c15ull);
+    uint32_t pos = (uint32_t)h & m->mask;
+    while (m->slots[pos].used) {
+        StrMapSlot *s = &m->slots[pos];
+        if (s->hash == h && s->key.len == key.len && memcmp(s->key.ptr, key.ptr, key.len) == 0) {
+            *inserted = false;
+            return s->val;
+        }
+        pos = (pos + 1u) & m->mask;
+    }
+    m->slots[pos] = (StrMapSlot){ h, key, new_val, 1u };
+    m->count++;
+    *inserted = true;
+    return new_val;
+}
+
 static int cmp_bucket_desc(const void *a, const void *b) {
     const StelogCountBucket *ba = (const StelogCountBucket *)a;
     const StelogCountBucket *bb = (const StelogCountBucket *)b;
@@ -1342,6 +1393,8 @@ static void build_count_by_buckets(const StelogIndex *idx,
     uint32_t cap = 64;
     StelogCountBucket *bk = (StelogCountBucket *)stelog_arena_alloc_aligned(scratch, cap * sizeof(StelogCountBucket), 8);
     uint32_t cnt = 0;
+    StrMap keymap;
+    strmap_init(&keymap, scratch, 64);
 
     for (uint32_t i = 0; i < cands->count; ++i) {
         const StelogSegment *seg = cands->items[i].is_delta ? &idx->delta : &idx->base;
@@ -1374,16 +1427,12 @@ static void build_count_by_buckets(const StelogIndex *idx,
                 continue;
         }
 
-        bool found = false;
-        for (uint32_t k = 0; k < cnt; ++k) {
-            if (bk[k].key.len == key.len && memcmp(bk[k].key.ptr, key.ptr, key.len) == 0) {
-                bk[k].count++;
-                if (seg->col_ts_ms[d] > bk[k].meta_last_ts_ms) bk[k].meta_last_ts_ms = seg->col_ts_ms[d];
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
+        bool inserted = false;
+        uint32_t k = strmap_get_or_put(&keymap, key, cnt, &inserted);
+        if (!inserted) {
+            bk[k].count++;
+            if (seg->col_ts_ms[d] > bk[k].meta_last_ts_ms) bk[k].meta_last_ts_ms = seg->col_ts_ms[d];
+        } else {
             if (cnt == cap) {
                 uint32_t ncap = cap * 2;
                 StelogCountBucket *nb = (StelogCountBucket *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(StelogCountBucket), 8);
@@ -1409,13 +1458,31 @@ static void build_count_by_buckets(const StelogIndex *idx,
     *out_count = cnt;
 }
 
-static int cmp_session_hit_desc(const void *a, const void *b) {
+/* Relevance ranking: the best single hit dominates, hit volume only adds a log-scaled boost,
+   so a long session with many weak mentions does not outrank a short one that is squarely on topic. */
+static int cmp_session_hit_rank_desc(const void *a, const void *b) {
     const StelogSessionHit *sa = (const StelogSessionHit *)a;
     const StelogSessionHit *sb = (const StelogSessionHit *)b;
-    if (sa->hit_count > sb->hit_count) return -1;
-    if (sa->hit_count < sb->hit_count) return 1;
+    if (sa->rank_score > sb->rank_score) return -1;
+    if (sa->rank_score < sb->rank_score) return 1;
     if (sa->last_hit_ts_ms > sb->last_hit_ts_ms) return -1;
     if (sa->last_hit_ts_ms < sb->last_hit_ts_ms) return 1;
+    return 0;
+}
+
+static int cmp_session_hit_newest(const void *a, const void *b) {
+    const StelogSessionHit *sa = (const StelogSessionHit *)a;
+    const StelogSessionHit *sb = (const StelogSessionHit *)b;
+    if (sa->last_hit_ts_ms > sb->last_hit_ts_ms) return -1;
+    if (sa->last_hit_ts_ms < sb->last_hit_ts_ms) return 1;
+    return 0;
+}
+
+static int cmp_session_hit_oldest(const void *a, const void *b) {
+    const StelogSessionHit *sa = (const StelogSessionHit *)a;
+    const StelogSessionHit *sb = (const StelogSessionHit *)b;
+    if (sa->first_hit_ts_ms < sb->first_hit_ts_ms) return -1;
+    if (sa->first_hit_ts_ms > sb->first_hit_ts_ms) return 1;
     return 0;
 }
 
@@ -1424,13 +1491,18 @@ static void build_session_groups(const StelogIndex *idx,
                                  const StelogQueryPlan *plan,
                                  const StelogRegex *re,
                                  StelogRegexMatcher *re_matcher,
+                                 StelogSortMode sort_mode,
                                  StelogArena *scratch,
                                  StelogSessionHit **out_groups,
                                  uint32_t *out_count) {
     uint32_t cap = 64;
     StelogSessionHit *grp = (StelogSessionHit *)stelog_arena_alloc_aligned(scratch, cap * sizeof(StelogSessionHit), 8);
     float *best_scores = (float *)stelog_arena_alloc_aligned(scratch, cap * sizeof(float), 8);
+    float *snip_scores = (float *)stelog_arena_alloc_aligned(scratch, cap * sizeof(float), 8);
+    uint8_t *snip_dialogue = (uint8_t *)stelog_arena_alloc_aligned(scratch, cap, 8);
     uint32_t cnt = 0;
+    StrMap sidmap;
+    strmap_init(&sidmap, scratch, 64);
 
     for (uint32_t i = 0; i < cands->count; ++i) {
         const ScoredCand *sc = &cands->items[i];
@@ -1439,21 +1511,20 @@ static void build_session_groups(const StelogIndex *idx,
         const StelogSessionRecord *sr = &seg->sessions[seg->col_session_id[d]];
         StelogStr sid = stelog_seg_str(seg, sr->session_id);
 
-        uint32_t idx_found = UINT32_MAX;
-        for (uint32_t k = 0; k < cnt; ++k) {
-            if (grp[k].session_id.len == sid.len && memcmp(grp[k].session_id.ptr, sid.ptr, sid.len) == 0) {
-                idx_found = k;
-                break;
-            }
-        }
-        if (idx_found == UINT32_MAX) {
+        bool inserted = false;
+        uint32_t idx_found = strmap_get_or_put(&sidmap, sid, cnt, &inserted);
+        if (inserted) {
             if (cnt == cap) {
                 uint32_t ncap = cap * 2;
                 StelogSessionHit *ng = (StelogSessionHit *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(StelogSessionHit), 8);
                 float *ns = (float *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(float), 8);
+                float *nss = (float *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(float), 8);
+                uint8_t *nsd = (uint8_t *)stelog_arena_alloc_aligned(scratch, ncap, 8);
                 memcpy(ng, grp, cnt * sizeof(StelogSessionHit));
                 memcpy(ns, best_scores, cnt * sizeof(float));
-                grp = ng; best_scores = ns; cap = ncap;
+                memcpy(nss, snip_scores, cnt * sizeof(float));
+                memcpy(nsd, snip_dialogue, cnt);
+                grp = ng; best_scores = ns; snip_scores = nss; snip_dialogue = nsd; cap = ncap;
             }
             idx_found = cnt++;
             memset(&grp[idx_found], 0, sizeof(StelogSessionHit));
@@ -1464,21 +1535,38 @@ static void build_session_groups(const StelogIndex *idx,
             grp[idx_found].first_hit_ts_ms = sc->ts_ms;
             grp[idx_found].last_hit_ts_ms  = sc->ts_ms;
             best_scores[idx_found]         = -1.0f;
+            snip_scores[idx_found]         = -1.0f;
+            snip_dialogue[idx_found]       = 0;
         }
         StelogSessionHit *g = &grp[idx_found];
         g->hit_count++;
         if (sc->ts_ms < g->first_hit_ts_ms) g->first_hit_ts_ms = sc->ts_ms;
         if (sc->ts_ms > g->last_hit_ts_ms)  g->last_hit_ts_ms  = sc->ts_ms;
-        if (sc->score > best_scores[idx_found]) {
-            best_scores[idx_found] = sc->score;
-            g->best_doc_id = stelog_make_doc_id(sc->is_delta != 0, d);
+        if (sc->score > best_scores[idx_found]) best_scores[idx_found] = sc->score;
+        /* The representative snippet should show the conversation, so dialogue hits win over tool records
+           even when a tool call scores higher; ranking still uses the overall best score. */
+        StelogRoleKind rk = stelog_tag_role(seg->col_tag[d]);
+        uint8_t dlg = is_dialogue_role(rk) ? 1u : 0u;
+        if (dlg > snip_dialogue[idx_found] || (dlg == snip_dialogue[idx_found] && sc->score > snip_scores[idx_found])) {
+            snip_dialogue[idx_found] = dlg;
+            snip_scores[idx_found] = sc->score;
+            g->best_doc_id = seg->col_doc_key[d];
             const char *txt = seg->text_base + seg->col_text_off[d];
             g->best_snippet = build_snippet(scratch, txt, seg->col_text_len[d],
-                                            stelog_tag_role(seg->col_tag[d]), plan, re, re_matcher, 220, NULL);
+                                            rk, plan, re, re_matcher, 220, NULL);
         }
     }
 
-    if (cnt > 1) qsort(grp, cnt, sizeof(StelogSessionHit), cmp_session_hit_desc);
+    for (uint32_t k = 0; k < cnt; ++k) {
+        float best = best_scores[k] > 0.0f ? best_scores[k] : 0.0f;
+        grp[k].best_score = best;
+        grp[k].rank_score = best * (1.0f + 0.35f * log2f(1.0f + (float)grp[k].hit_count));
+    }
+    if (cnt > 1) {
+        if (sort_mode == STELOG_SORT_NEWEST)      qsort(grp, cnt, sizeof(StelogSessionHit), cmp_session_hit_newest);
+        else if (sort_mode == STELOG_SORT_OLDEST) qsort(grp, cnt, sizeof(StelogSessionHit), cmp_session_hit_oldest);
+        else                                      qsort(grp, cnt, sizeof(StelogSessionHit), cmp_session_hit_rank_desc);
+    }
     *out_groups = grp;
     *out_count = cnt;
 }
@@ -1498,7 +1586,8 @@ static void populate_hit(const StelogSegment *seg,
     uint32_t sid = seg->col_session_id[d];
     const StelogSessionRecord *sr = &seg->sessions[sid];
 
-    out->doc_id        = stelog_make_doc_id(is_delta, d);
+    (void)is_delta;
+    out->doc_id        = seg->col_doc_key[d];
     out->ts_ms         = seg->col_ts_ms[d];
     out->score         = score;
     out->tag           = seg->col_tag[d];
@@ -1570,8 +1659,26 @@ int stelog_index_search(StelogIndex *idx, const StelogQuery *q, StelogSearchResu
     const char *session_id = (q->session_id && q->session_id[0])
         ? q->session_id
         : (plan.mod_session.len ? stelog_arena_strndup(&idx->scratch, plan.mod_session.ptr, plan.mod_session.len) : NULL);
-    int64_t since_ms = q->since_ms ? q->since_ms : parse_mod_time_ms(plan.mod_since);
-    int64_t until_ms = q->until_ms ? q->until_ms : parse_mod_time_ms(plan.mod_until);
+    int64_t since_ms = q->since_ms;
+    int64_t until_ms = q->until_ms;
+    {
+        int64_t mod_since = 0, mod_until = 0;
+        bool ok_since = parse_mod_time_ms(plan.mod_since, false, &mod_since);
+        bool ok_until = parse_mod_time_ms(plan.mod_until, true, &mod_until);
+        if (!ok_since || !ok_until) {
+            StelogStr bad = !ok_since ? plan.mod_since : plan.mod_until;
+            char err_buf[320];
+            snprintf(err_buf, sizeof(err_buf),
+                     "Invalid inline %s:%.*s. Use 30m/24h/7d/2w, today, yesterday, YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS][Z|+HH:MM].",
+                     !ok_since ? "since" : "until", (int)(bad.len > 64 ? 64 : bad.len), bad.ptr);
+            char *copied = stelog_arena_strdup(&idx->scratch, err_buf);
+            out->error_msg = (StelogStr){ copied, (uint32_t)strlen(err_buf) };
+            rc = -2;
+            goto done;
+        }
+        if (!since_ms) since_ms = mod_since;
+        if (!until_ms) until_ms = mod_until;
+    }
 
     uint32_t limit    = q->limit ? q->limit : 20u;
     uint32_t offset   = q->offset;
@@ -1639,11 +1746,12 @@ int stelog_index_search(StelogIndex *idx, const StelogQuery *q, StelogSearchResu
     if (q->group_by_session) {
         StelogSessionHit *grps = NULL;
         uint32_t gcnt = 0;
-        build_session_groups(idx, &cands, &plan, re, re_matcher, &idx->scratch, &grps, &gcnt);
+        build_session_groups(idx, &cands, &plan, re, re_matcher, sort_mode, &idx->scratch, &grps, &gcnt);
         uint32_t avail = offset < gcnt ? (gcnt - offset) : 0u;
         uint32_t take = avail < limit ? avail : limit;
         out->session_groups = grps + offset;
         out->session_group_count = take;
+        out->session_group_total = gcnt;
         out->truncated = (offset + take < gcnt);
         goto done;
     }
@@ -1695,67 +1803,92 @@ done:
  * File-Touch Provenance (stelog files / MCP search_file_history)
  * ============================================================================ */
 
-static bool extract_file_touch_from_tool_call(const char *txt,
-                                              uint32_t len,
-                                              StelogArena *arena,
-                                              StelogStr *out_tool,
-                                              StelogStr *out_path) {
-    const char *colon = (const char *)memchr(txt, ':', len < 64 ? len : 64);
-    if (!colon) return false;
-    size_t tlen = (size_t)(colon - txt);
-    const char *args = colon + 1;
-    size_t alen = len - tlen - 1;
+#define MAX_TOUCH_PATHS 16u
 
-    bool is_write_tool = false;
-    if ((tlen == 9  && memcmp(txt, "edit_file", 9) == 0) ||
-        (tlen == 10 && memcmp(txt, "write_file", 10) == 0) ||
-        (tlen == 11 && memcmp(txt, "apply_patch", 11) == 0) ||
-        (tlen == 20 && memcmp(txt, "replace_file_content", 20) == 0) ||
-        (tlen == 26 && memcmp(txt, "multi_replace_file_content", 26) == 0) ||
-        (tlen == 4  && memcmp(txt, "edit", 4) == 0) ||
-        (tlen == 5  && memcmp(txt, "write", 5) == 0)) {
-        is_write_tool = true;
-    }
-    if (!is_write_tool) return false;
-
-    *out_tool = (StelogStr){ txt, (uint32_t)tlen };
-
-    const char *pm = stelog_memmem(args, alen, "*** Update File: ", 17);
-    if (!pm) pm = stelog_memmem(args, alen, "*** Add File: ", 14);
-    if (!pm) pm = stelog_memmem(args, alen, "*** Delete File: ", 17);
-    if (pm) {
-        const char *c = (const char *)memchr(pm, ':', (size_t)((args + alen) - pm));
-        if (c) {
-            const char *p = c + 1;
-            const char *end = args + alen;
-            while (p < end && *p == ' ') p++;
-            const char *pe = p;
-            while (pe < end && *pe != '\n' && *pe != '\r' && *pe != ' ') pe++;
-            if (pe > p) {
-                *out_path = (StelogStr){ stelog_arena_strndup(arena, p, (size_t)(pe - p)), (uint32_t)(pe - p) };
-                return true;
-            }
-        }
-    }
-
-    static const char *keys[] = { "\"Path\"", "\"path\"", "\"TargetFile\"", "\"file_path\"" };
-    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); ++k) {
-        size_t kl = strlen(keys[k]);
-        const char *hit = stelog_memmem(args, alen, keys[k], kl);
-        if (!hit) continue;
-        const char *p = hit + kl;
-        const char *end = args + alen;
-        while (p < end && (*p == ' ' || *p == ':' || *p == '"' || *p == '\\')) p++;
-        const char *pe = p;
-        while (pe < end && *pe != '"' && *pe != '\\' && *pe != ',' && *pe != '}' && *pe != '\n') pe++;
-        if (pe > p) {
-            *out_path = (StelogStr){ stelog_arena_strndup(arena, p, (size_t)(pe - p)), (uint32_t)(pe - p) };
-            return true;
-        }
+static bool is_write_tool_name(const char *t, size_t n) {
+    static const char *names[] = {
+        "edit_file", "write_file", "write_to_file", "apply_patch", "replace_file_content",
+        "multi_replace_file_content", "edit", "write", "Create", "Edit", "MultiEdit", "Write",
+        "ApplyPatch", "NotebookEdit"
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) {
+        size_t l = strlen(names[i]);
+        if (n == l && memcmp(t, names[i], l) == 0) return true;
     }
     return false;
 }
 
+static bool push_touch_path(StelogArena *arena, const char *p, const char *pe,
+                            StelogStr *out_paths, uint32_t *n, uint32_t max_paths) {
+    while (pe > p && (pe[-1] == ' ' || pe[-1] == '\t')) pe--;
+    if (pe <= p || *n >= max_paths) return false;
+    size_t l = (size_t)(pe - p);
+    for (uint32_t i = 0; i < *n; ++i) {
+        if (out_paths[i].len == l && memcmp(out_paths[i].ptr, p, l) == 0) return true;
+    }
+    out_paths[*n] = (StelogStr){ stelog_arena_strndup(arena, p, l), (uint32_t)l };
+    (*n)++;
+    return true;
+}
+
+/* Extracts every file a write-style tool call touched. Patch bodies may sit inside exec/shell wrappers,
+   so "*** <Op> File:" markers count for any tool once the text contains "*** Begin Patch". */
+static uint32_t extract_file_touches_from_tool_call(const char *txt,
+                                                    uint32_t len,
+                                                    StelogArena *arena,
+                                                    StelogStr *out_tool,
+                                                    StelogStr *out_paths,
+                                                    uint32_t max_paths) {
+    const char *colon = (const char *)memchr(txt, ':', len < 64 ? len : 64);
+    if (!colon) return 0;
+    size_t tlen = (size_t)(colon - txt);
+    const char *args = colon + 1;
+    size_t alen = len - tlen - 1;
+    const char *end = args + alen;
+
+    bool is_write_tool = is_write_tool_name(txt, tlen);
+    bool has_patch = stelog_memmem(args, alen, "*** Begin Patch", 15) != NULL;
+    if (!is_write_tool && !has_patch) return 0;
+
+    *out_tool = is_write_tool ? (StelogStr){ txt, (uint32_t)tlen } : (StelogStr){ "apply_patch", 11 };
+    uint32_t n = 0;
+
+    static const char *markers[] = { "*** Update File: ", "*** Add File: ", "*** Delete File: " };
+    for (size_t m = 0; m < 3; ++m) {
+        size_t ml = strlen(markers[m]);
+        const char *scan = args;
+        while (scan < end) {
+            const char *pm = stelog_memmem(scan, (size_t)(end - scan), markers[m], ml);
+            if (!pm) break;
+            const char *p = pm + ml;
+            const char *pe = p;
+            while (pe < end && *pe != '\n' && *pe != '\r' && *pe != '\\' && *pe != '"') pe++;
+            push_touch_path(arena, p, pe, out_paths, &n, max_paths);
+            scan = pe;
+        }
+    }
+    if (n > 0 || !is_write_tool) return n;
+
+    static const char *keys[] = {
+        "\"Path\"", "\"path\"", "\"TargetFile\"", "\"file_path\"", "\"filePath\"", "\"FilePath\"",
+        "\"AbsolutePath\"", "\"absolute_path\"", "\"target_file\"", "\"notebook_path\""
+    };
+    const char *best = NULL;
+    size_t best_kl = 0;
+    for (size_t k = 0; k < sizeof(keys) / sizeof(keys[0]); ++k) {
+        size_t kl = strlen(keys[k]);
+        const char *hit = stelog_memmem(args, alen, keys[k], kl);
+        if (hit && (!best || hit < best)) { best = hit; best_kl = kl; }
+    }
+    if (best) {
+        const char *p = best + best_kl;
+        while (p < end && (*p == ' ' || *p == ':' || *p == '"' || *p == '\\')) p++;
+        const char *pe = p;
+        while (pe < end && *pe != '"' && *pe != '\\' && *pe != ',' && *pe != '}' && *pe != '\n') pe++;
+        push_touch_path(arena, p, pe, out_paths, &n, max_paths);
+    }
+    return n;
+}
 static int cmp_file_touch_desc(const void *a, const void *b) {
     const StelogFileTouch *fa = (const StelogFileTouch *)a;
     const StelogFileTouch *fb = (const StelogFileTouch *)b;
@@ -1819,27 +1952,29 @@ static void scan_segment_files(const StelogIndex *idx,
 
         const char *txt = seg->text_base + seg->col_text_off[d];
         uint32_t tlen = seg->col_text_len[d];
-        StelogStr tool_name, touched;
-        if (!extract_file_touch_from_tool_call(txt, tlen, scratch, &tool_name, &touched)) continue;
-        if (flen > 0 && !stelog_memcasemem(touched.ptr, touched.len, file_substr, flen)) continue;
-
-        if (*io_count == *io_cap) {
-            uint32_t ncap = *io_cap ? (*io_cap * 2) : 128;
-            StelogFileTouch *ni = (StelogFileTouch *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(StelogFileTouch), 8);
-            if (*io_count > 0) memcpy(ni, *io_items, (*io_count) * sizeof(StelogFileTouch));
-            *io_items = ni;
-            *io_cap = ncap;
+        StelogStr tool_name;
+        StelogStr touched[MAX_TOUCH_PATHS];
+        uint32_t nt = extract_file_touches_from_tool_call(txt, tlen, scratch, &tool_name, touched, MAX_TOUCH_PATHS);
+        for (uint32_t ti = 0; ti < nt; ++ti) {
+            if (flen > 0 && !stelog_memcasemem(touched[ti].ptr, touched[ti].len, file_substr, flen)) continue;
+            if (*io_count == *io_cap) {
+                uint32_t ncap = *io_cap ? (*io_cap * 2) : 128;
+                StelogFileTouch *ni = (StelogFileTouch *)stelog_arena_alloc_aligned(scratch, ncap * sizeof(StelogFileTouch), 8);
+                if (*io_count > 0) memcpy(ni, *io_items, (*io_count) * sizeof(StelogFileTouch));
+                *io_items = ni;
+                *io_cap = ncap;
+            }
+            StelogFileTouch *ft = &(*io_items)[(*io_count)++];
+            ft->doc_id       = seg->col_doc_key[d];
+            ft->ts_ms        = seg->col_ts_ms[d];
+            ft->tag          = tag;
+            ft->file_touched = touched[ti];
+            ft->tool_name    = tool_name;
+            ft->session_id   = sstr;
+            ft->title        = stelog_seg_str(seg, sr->title);
+            ft->project      = proj;
+            ft->actor        = stelog_seg_str(seg, seg->actors[seg->col_actor_id[d]]);
         }
-        StelogFileTouch *ft = &(*io_items)[(*io_count)++];
-        ft->doc_id       = stelog_make_doc_id(is_delta, d);
-        ft->ts_ms        = seg->col_ts_ms[d];
-        ft->tag          = tag;
-        ft->file_touched = touched;
-        ft->tool_name    = tool_name;
-        ft->session_id   = sstr;
-        ft->title        = stelog_seg_str(seg, sr->title);
-        ft->project      = proj;
-        ft->actor        = stelog_seg_str(seg, seg->actors[seg->col_actor_id[d]]);
     }
 }
 
@@ -1898,8 +2033,10 @@ int stelog_index_context(StelogIndex *idx,
     double t0 = stelog_now_ms();
     stelog_arena_reset(&idx->scratch);
 
-    bool is_delta = stelog_doc_is_delta(anchor_doc_id);
-    uint32_t d = stelog_doc_local_id(anchor_doc_id);
+    uint64_t internal_id;
+    if (!stelog_index_resolve_doc_id(idx, anchor_doc_id, &internal_id)) return -1;
+    bool is_delta = stelog_doc_is_delta(internal_id);
+    uint32_t d = stelog_doc_local_id(internal_id);
     const StelogSegment *seg = is_delta ? &idx->delta : &idx->base;
     if (!seg->loaded || d >= seg->doc_count) return -1;
 
@@ -2010,31 +2147,134 @@ static int cmp_digest_ref(const void *a, const void *b) {
     return (ra->local_doc < rb->local_doc) ? -1 : 1;
 }
 
+static bool str_prefix_ieq(StelogStr s, const char *p, size_t plen) {
+    if (s.len < plen) return false;
+    for (size_t i = 0; i < plen; ++i) {
+        char a = s.ptr[i], b = p[i];
+        if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+        if (a != b) return false;
+    }
+    return true;
+}
+
+static int cmp_summary_last_ts_desc(const void *a, const void *b) {
+    const StelogSessionSummary *sa = (const StelogSessionSummary *)a;
+    const StelogSessionSummary *sb = (const StelogSessionSummary *)b;
+    if (sa->last_ts_ms > sb->last_ts_ms) return -1;
+    if (sa->last_ts_ms < sb->last_ts_ms) return 1;
+    return 0;
+}
+
+#define RESOLVE_TRACK_MAX 64u
+
+uint32_t stelog_index_resolve_session(const StelogIndex *idx,
+                                      const char *id_or_prefix,
+                                      StelogSessionSummary *out,
+                                      uint32_t cap) {
+    if (!idx || !id_or_prefix) return 0;
+    const char *p = id_or_prefix;
+    if (p[0] == '@') p++;
+    size_t plen = strlen(p);
+    if (plen == 0) return 0;
+
+    StelogSessionSummary found[RESOLVE_TRACK_MAX];
+    uint32_t nfound = 0;
+    uint32_t total = 0;
+    bool have_exact = false;
+
+    const StelogSegment *segs[2] = { &idx->base, &idx->delta };
+    for (int si = 0; si < 2; ++si) {
+        const StelogSegment *seg = segs[si];
+        if (!seg->loaded) continue;
+        for (uint32_t s = 0; s < seg->session_count; ++s) {
+            const StelogSessionRecord *sr = &seg->sessions[s];
+            if (sr->doc_count == 0) continue;
+            StelogStr ss = stelog_seg_str(seg, sr->session_id);
+            if (!str_prefix_ieq(ss, p, plen)) continue;
+            bool is_exact = (ss.len == plen);
+            if (have_exact && !is_exact) continue;
+            if (is_exact && !have_exact) {
+                have_exact = true;
+                nfound = 0;
+                total = 0;
+            }
+            uint32_t j = 0;
+            for (; j < nfound; ++j) {
+                if (found[j].session_id.len == ss.len && memcmp(found[j].session_id.ptr, ss.ptr, ss.len) == 0) break;
+            }
+            if (j < nfound) {
+                if (sr->first_ts_ms < found[j].first_ts_ms) found[j].first_ts_ms = sr->first_ts_ms;
+                if (sr->last_ts_ms > found[j].last_ts_ms) found[j].last_ts_ms = sr->last_ts_ms;
+                found[j].doc_count += sr->doc_count;
+                if (found[j].title.len == 0) found[j].title = stelog_seg_str(seg, sr->title);
+                continue;
+            }
+            total++;
+            if (nfound < RESOLVE_TRACK_MAX) {
+                StelogSessionSummary *dst = &found[nfound++];
+                memset(dst, 0, sizeof(*dst));
+                dst->session_id        = ss;
+                dst->title             = stelog_seg_str(seg, sr->title);
+                dst->project           = stelog_seg_str(seg, sr->cwd);
+                dst->git_branch        = stelog_seg_str(seg, sr->git_branch);
+                dst->parent_session_id = stelog_seg_str(seg, sr->parent_session_id);
+                dst->first_ts_ms       = sr->first_ts_ms;
+                dst->last_ts_ms        = sr->last_ts_ms;
+                dst->doc_count         = sr->doc_count;
+                dst->agent             = (StelogAgentKind)sr->agent_kind;
+                dst->flags             = sr->flags;
+            }
+        }
+    }
+    if (nfound > 1) qsort(found, nfound, sizeof(StelogSessionSummary), cmp_summary_last_ts_desc);
+    uint32_t n = nfound < cap ? nfound : cap;
+    if (out && n > 0) memcpy(out, found, n * sizeof(StelogSessionSummary));
+    return total;
+}
+
+uint32_t stelog_index_unique_prefix_len(const StelogIndex *idx, StelogStr session_id, uint32_t min_len) {
+    if (session_id.len <= min_len) return session_id.len;
+    if (!idx) return min_len;
+    uint32_t longest_common = 0;
+    const StelogSegment *segs[2] = { &idx->base, &idx->delta };
+    for (int si = 0; si < 2; ++si) {
+        const StelogSegment *seg = segs[si];
+        if (!seg->loaded) continue;
+        for (uint32_t s = 0; s < seg->session_count; ++s) {
+            StelogStr ss = stelog_seg_str(seg, seg->sessions[s].session_id);
+            if (ss.len < min_len) continue;
+            uint32_t n = ss.len < session_id.len ? ss.len : session_id.len;
+            uint32_t c = 0;
+            while (c < n) {
+                char a = ss.ptr[c], b = session_id.ptr[c];
+                if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z') b = (char)(b - 'A' + 'a');
+                if (a != b) break;
+                c++;
+            }
+            if (c == ss.len && c == session_id.len) continue; /* same session (base/delta copy) */
+            if (c > longest_common) longest_common = c;
+        }
+    }
+    uint32_t need = longest_common + 1u;
+    if (need < min_len) need = min_len;
+    if (need > session_id.len) need = session_id.len;
+    return need;
+}
+
 static void collect_session_docs_for_digest(const StelogIndex *idx,
                                             const StelogSegment *seg,
                                             bool is_delta,
-                                            const char *prefix,
-                                            size_t plen,
+                                            StelogStr session_id,
                                             StelogArena *scratch,
                                             DigestRef **io_refs,
                                             uint32_t *io_cnt,
-                                            uint32_t *io_cap,
-                                            StelogDigestResult *out) {
+                                            uint32_t *io_cap) {
     if (!seg || !seg->loaded) return;
     for (uint32_t s = 0; s < seg->session_count; ++s) {
         StelogStr ss = stelog_seg_str(seg, seg->sessions[s].session_id);
-        if (ss.len < plen || stelog_memcasemem(ss.ptr, plen, prefix, plen) != ss.ptr) continue;
-        /* Lock to first matched session_id if multiple prefixes match */
-        if (out->session_id.len > 0 &&
-            (out->session_id.len != ss.len || memcmp(out->session_id.ptr, ss.ptr, ss.len) != 0)) {
-            continue;
-        }
-        if (out->session_id.len == 0) {
-            out->session_id = ss;
-            out->title      = stelog_seg_str(seg, seg->sessions[s].title);
-            out->project    = stelog_seg_str(seg, seg->sessions[s].cwd);
-            out->agent      = (StelogAgentKind)seg->sessions[s].agent_kind;
-        }
+        if (ss.len != session_id.len || memcmp(ss.ptr, session_id.ptr, ss.len) != 0) continue;
         uint32_t sb = seg->session_offsets[s];
         uint32_t se = seg->session_offsets[s + 1];
         for (uint32_t i = sb; i < se; ++i) {
@@ -2052,28 +2292,76 @@ static void collect_session_docs_for_digest(const StelogIndex *idx,
     }
 }
 
-int stelog_index_digest(StelogIndex *idx,
-                        const char *session_prefix,
-                        uint32_t max_total_bytes,
-                        bool include_tools,
-                        StelogDigestResult *out) {
-    if (!idx || !session_prefix || !session_prefix[0] || !out) return -1;
+/* Per-turn byte cap so short turns donate unused budget to substantive ones. `rem_turns` is how many
+   turns still compete for `rem` bytes. */
+static uint32_t digest_item_cap(StelogRoleKind rk, uint32_t rem, uint32_t rem_turns) {
+    if (rem_turns == 0) rem_turns = 1;
+    uint32_t overhead = rem_turns * 72u;
+    uint32_t dyn = (rem > overhead) ? ((rem - overhead) / rem_turns) : 120u;
+    if (dyn < 120u) dyn = 120u;
+    if (dyn > 1200u) dyn = 1200u;
+    uint32_t cap = dyn;
+    if (rk == STELOG_ROLE_USER) {
+        cap = (dyn * 3u) / 2u;
+        if (cap < 320u) cap = 320u;
+        if (cap > 600u) cap = 600u;
+    }
+    uint32_t max_allowed = rem > 72u ? (rem - 72u) : 120u;
+    return cap < max_allowed ? cap : max_allowed;
+}
+
+/* Emits kept[i] for i in [start, end) moving forward until the budget runs out; returns the number emitted. */
+static uint32_t digest_emit_forward(const DigestRef *kept, const uint32_t *tools_before, uint32_t start, uint32_t end,
+                                    uint32_t budget, uint32_t turn_estimate_cap, StelogArena *scratch, StelogHit *items) {
+    uint32_t used = 0, emitted = 0;
+    for (uint32_t i = start; i < end; ++i) {
+        if (used + 80u > budget && emitted > 0) break;
+        const StelogSegment *seg = kept[i].seg;
+        uint32_t d = kept[i].local_doc;
+        StelogRoleKind rk = stelog_tag_role(seg->col_tag[d]);
+        uint32_t rem_turns = end - i;
+        if (turn_estimate_cap && rem_turns > turn_estimate_cap) rem_turns = turn_estimate_cap;
+        uint32_t rem = budget > used ? (budget - used) : 0u;
+        uint32_t cap = digest_item_cap(rk, rem, rem_turns);
+        populate_hit(seg, kept[i].is_delta, d, 1.0f, 0, NULL, NULL, NULL, cap, scratch, &items[emitted]);
+        items[emitted].collapsed_tools_before = tools_before[i];
+        used += items[emitted].snippet.len + 72u;
+        emitted++;
+    }
+    return emitted;
+}
+
+int stelog_index_digest_ex(StelogIndex *idx, const StelogDigestOptions *opts, StelogDigestResult *out) {
+    if (!idx || !opts || !opts->session || !opts->session[0] || !out) return -1;
     memset(out, 0, sizeof(*out));
     double t0 = stelog_now_ms();
     stelog_arena_reset(&idx->scratch);
 
-    const char *sp = session_prefix;
-    if (sp[0] == '@') sp++;
-    size_t plen = strlen(sp);
-    if (plen == 0) return -1;
+    uint32_t matches = stelog_index_resolve_session(idx, opts->session, out->candidates, STELOG_MAX_SESSION_CANDIDATES);
+    out->match_count = matches;
+    out->candidate_count = matches < STELOG_MAX_SESSION_CANDIDATES ? matches : STELOG_MAX_SESSION_CANDIDATES;
+    if (matches == 0) return -1;
+    if (matches > 1) {
+        out->elapsed_ms = stelog_now_ms() - t0;
+        return -2;
+    }
+    const StelogSessionSummary *target = &out->candidates[0];
+    out->session_id  = target->session_id;
+    out->title       = target->title;
+    out->project     = target->project;
+    out->agent       = target->agent;
+    out->first_ts_ms = target->first_ts_ms;
+    out->last_ts_ms  = target->last_ts_ms;
 
     DigestRef *refs = NULL;
     uint32_t ref_cnt = 0, ref_cap = 0;
-    collect_session_docs_for_digest(idx, &idx->base,  false, sp, plen, &idx->scratch, &refs, &ref_cnt, &ref_cap, out);
-    collect_session_docs_for_digest(idx, &idx->delta, true,  sp, plen, &idx->scratch, &refs, &ref_cnt, &ref_cap, out);
+    collect_session_docs_for_digest(idx, &idx->base,  false, out->session_id, &idx->scratch, &refs, &ref_cnt, &ref_cap);
+    collect_session_docs_for_digest(idx, &idx->delta, true,  out->session_id, &idx->scratch, &refs, &ref_cnt, &ref_cap);
 
     if (ref_cnt == 0) return -1;
     if (ref_cnt > 1) qsort(refs, ref_cnt, sizeof(DigestRef), cmp_digest_ref);
+    out->first_ts_ms = refs[0].ts_ms;
+    out->last_ts_ms  = refs[ref_cnt - 1].ts_ms;
 
     /* Pass 1: filter to dialogue turns (unless include_tools), collapse intermediate tools, dedup consecutive retries */
     DigestRef *kept = (DigestRef *)stelog_arena_alloc_aligned(&idx->scratch, ref_cnt * sizeof(DigestRef), 8);
@@ -2088,7 +2376,7 @@ int stelog_index_digest(StelogIndex *idx,
         const StelogSegment *seg = refs[i].seg;
         uint32_t d = refs[i].local_doc;
         StelogRoleKind rk = stelog_tag_role(seg->col_tag[d]);
-        if (!include_tools && !is_dialogue_role(rk)) {
+        if (!opts->include_tools && !is_dialogue_role(rk)) {
             tools_acc++;
             out->total_tools_collapsed++;
             continue;
@@ -2111,49 +2399,61 @@ int stelog_index_digest(StelogIndex *idx,
     }
 
     out->total_dialogue_turns = kept_cnt;
-    if (kept_cnt == 0) {
+    uint32_t off = opts->turn_offset;
+    out->turn_offset = off;
+    if (kept_cnt == 0 || off >= kept_cnt) {
         out->elapsed_ms = stelog_now_ms() - t0;
         return 0;
     }
 
-    /* Dynamic per-turn byte budget within max_total_bytes so short turns donate unused budget
-       to substantive turns and the full session timeline fits inline without dropping tail decisions. */
-    uint32_t budget = max_total_bytes ? max_total_bytes : 7200u;
-
+    uint32_t budget = opts->max_total_bytes ? opts->max_total_bytes : 7200u;
     StelogHit *items = (StelogHit *)stelog_arena_alloc_aligned(&idx->scratch, kept_cnt * sizeof(StelogHit), 8);
-    uint32_t used_bytes = 0;
-    uint32_t emitted = 0;
+    uint32_t emitted = digest_emit_forward(kept, tools_before, off, kept_cnt, budget, 0, &idx->scratch, items);
 
-    for (uint32_t i = 0; i < kept_cnt; ++i) {
-        const StelogSegment *seg = kept[i].seg;
-        uint32_t d = kept[i].local_doc;
-        StelogRoleKind rk = stelog_tag_role(seg->col_tag[d]);
+    if (off + emitted < kept_cnt) {
+        out->truncated = true;
+        if (off == 0 && kept_cnt >= 3) {
+            /* Head + tail sampling: the opening request and the final conclusions are what readers need most,
+               so the omitted span sits in the middle where it can be paged with turn_offset. */
+            uint32_t head_budget = (budget * 2u) / 5u;
+            uint32_t tail_budget = budget - head_budget;
+            uint32_t head_n = digest_emit_forward(kept, tools_before, 0, kept_cnt - 1u, head_budget, 8u, &idx->scratch, items);
 
-        if (used_bytes + 80u > budget && emitted > 0) {
-            out->truncated = true;
-            break;
+            StelogHit *tail_tmp = (StelogHit *)stelog_arena_alloc_aligned(&idx->scratch, kept_cnt * sizeof(StelogHit), 8);
+            uint32_t tail_n = 0, used = 0;
+            for (uint32_t i = kept_cnt; i > head_n; --i) {
+                uint32_t k = i - 1u;
+                if (used + 80u > tail_budget && tail_n > 0) break;
+                const StelogSegment *seg = kept[k].seg;
+                uint32_t d = kept[k].local_doc;
+                StelogRoleKind rk = stelog_tag_role(seg->col_tag[d]);
+                uint32_t rem_turns = k - head_n + 1u;
+                if (rem_turns > 8u) rem_turns = 8u;
+                uint32_t rem = tail_budget > used ? (tail_budget - used) : 0u;
+                uint32_t cap = digest_item_cap(rk, rem, rem_turns);
+                populate_hit(seg, kept[k].is_delta, d, 1.0f, 0, NULL, NULL, NULL, cap, &idx->scratch, &tail_tmp[tail_n]);
+                tail_tmp[tail_n].collapsed_tools_before = tools_before[k];
+                used += tail_tmp[tail_n].snippet.len + 72u;
+                tail_n++;
+            }
+            for (uint32_t j = 0; j < tail_n; ++j) items[head_n + j] = tail_tmp[tail_n - 1u - j];
+            emitted = head_n + tail_n;
+            uint32_t tail_start = kept_cnt - tail_n;
+            out->gap_item_index = head_n;
+            out->omitted_begin  = head_n;
+            out->omitted_count  = tail_start > head_n ? tail_start - head_n : 0u;
+            out->next_offset    = head_n;
+            if (out->omitted_count == 0) {
+                out->truncated = false;
+                out->gap_item_index = 0;
+                out->next_offset = 0;
+            }
+        } else {
+            out->gap_item_index = emitted;
+            out->omitted_begin  = off + emitted;
+            out->omitted_count  = kept_cnt - (off + emitted);
+            out->next_offset    = off + emitted;
         }
-        uint32_t rem_turns = kept_cnt - i;
-        uint32_t rem = budget > used_bytes ? (budget - used_bytes) : 0u;
-        uint32_t overhead = rem_turns * 72u;
-        uint32_t dyn_per_turn = (rem > overhead) ? ((rem - overhead) / rem_turns) : 120u;
-        if (dyn_per_turn < 120u) dyn_per_turn = 120u;
-        if (dyn_per_turn > 1200u) dyn_per_turn = 1200u;
-
-        uint32_t item_cap = dyn_per_turn;
-        if (rk == STELOG_ROLE_USER) {
-            uint32_t user_cap = (dyn_per_turn * 3u) / 2u;
-            if (user_cap < 320u) user_cap = 320u;
-            if (user_cap > 600u) user_cap = 600u;
-            item_cap = user_cap;
-        }
-        uint32_t max_allowed = rem > 72u ? (rem - 72u) : 120u;
-        if (item_cap > max_allowed) item_cap = max_allowed;
-
-        populate_hit(seg, kept[i].is_delta, d, 1.0f, 0, NULL, NULL, NULL, item_cap, &idx->scratch, &items[emitted]);
-        items[emitted].collapsed_tools_before = tools_before[i];
-        used_bytes += items[emitted].snippet.len + 72u;
-        emitted++;
     }
 
     out->items = items;
@@ -2162,9 +2462,51 @@ int stelog_index_digest(StelogIndex *idx,
     return 0;
 }
 
+int stelog_index_digest(StelogIndex *idx,
+                        const char *session_prefix,
+                        uint32_t max_total_bytes,
+                        bool include_tools,
+                        StelogDigestResult *out) {
+    StelogDigestOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.session = session_prefix;
+    opts.max_total_bytes = max_total_bytes;
+    opts.include_tools = include_tools;
+    return stelog_index_digest_ex(idx, &opts, out);
+}
+
 /* ============================================================================
  * Single Document / O(1) pread Raw JSONL Retrieval
  * ============================================================================ */
+
+static bool segment_find_doc_key(const StelogSegment *seg, uint64_t key, uint32_t *out_doc) {
+    if (!seg->loaded || seg->doc_count == 0) return false;
+    uint32_t lo = 0, hi = seg->doc_count;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2u;
+        if (seg->col_doc_key[seg->col_key_order[mid]] < key) lo = mid + 1u;
+        else hi = mid;
+    }
+    if (lo >= seg->doc_count || seg->col_doc_key[seg->col_key_order[lo]] != key) return false;
+    *out_doc = seg->col_key_order[lo];
+    return true;
+}
+
+bool stelog_index_resolve_doc_id(const StelogIndex *idx, uint64_t doc_id, uint64_t *out_internal_id) {
+    if (!idx || doc_id == 0 || doc_id > STELOG_DOC_KEY_MASK) return false;
+    uint32_t d;
+    /* Delta first: a re-ingested transcript lives there while its Base copy is tombstoned. */
+    if (segment_find_doc_key(&idx->delta, doc_id, &d)) {
+        if (out_internal_id) *out_internal_id = stelog_make_doc_id(true, d);
+        return true;
+    }
+    if (segment_find_doc_key(&idx->base, doc_id, &d) &&
+        !stelog_index_base_file_tombstoned(idx, idx->base.col_file_id[d])) {
+        if (out_internal_id) *out_internal_id = stelog_make_doc_id(false, d);
+        return true;
+    }
+    return false;
+}
 
 int stelog_index_get_document(StelogIndex *idx,
                               uint64_t doc_id,
@@ -2178,8 +2520,10 @@ int stelog_index_get_document(StelogIndex *idx,
     double t0 = stelog_now_ms();
     stelog_arena_reset(&idx->scratch);
 
-    bool is_delta = stelog_doc_is_delta(doc_id);
-    uint32_t d = stelog_doc_local_id(doc_id);
+    uint64_t internal_id;
+    if (!stelog_index_resolve_doc_id(idx, doc_id, &internal_id)) return -1;
+    bool is_delta = stelog_doc_is_delta(internal_id);
+    uint32_t d = stelog_doc_local_id(internal_id);
     const StelogSegment *seg = is_delta ? &idx->delta : &idx->base;
     if (!seg->loaded || d >= seg->doc_count) return -1;
 
@@ -2262,6 +2606,7 @@ static void collect_segment_sessions(const StelogSegment *seg,
                                      const char *project_substr,
                                      int64_t since_ms,
                                      int64_t until_ms,
+                                     StrMap *sidmap,
                                      StelogSessionSummary *arr,
                                      uint32_t *io_count) {
     if (!seg || !seg->loaded) return;
@@ -2278,20 +2623,15 @@ static void collect_segment_sessions(const StelogSegment *seg,
         if (plen > 0 && (!proj.len || !stelog_memcasemem(proj.ptr, proj.len, project_substr, plen))) continue;
 
         StelogStr sid = stelog_seg_str(seg, sr->session_id);
-        bool merged = false;
-        for (uint32_t i = 0; i < *io_count; ++i) {
-            if (arr[i].agent == (StelogAgentKind)sr->agent_kind &&
-                arr[i].session_id.len == sid.len &&
-                memcmp(arr[i].session_id.ptr, sid.ptr, sid.len) == 0) {
-                if (sr->first_ts_ms < arr[i].first_ts_ms) arr[i].first_ts_ms = sr->first_ts_ms;
-                if (sr->last_ts_ms > arr[i].last_ts_ms) arr[i].last_ts_ms = sr->last_ts_ms;
-                arr[i].doc_count += sr->doc_count;
-                if (arr[i].title.len == 0 && sr->title.len > 0) arr[i].title = stelog_seg_str(seg, sr->title);
-                merged = true;
-                break;
-            }
+        bool inserted = false;
+        uint32_t i = strmap_get_or_put(sidmap, sid, *io_count, &inserted);
+        if (!inserted) {
+            if (sr->first_ts_ms < arr[i].first_ts_ms) arr[i].first_ts_ms = sr->first_ts_ms;
+            if (sr->last_ts_ms > arr[i].last_ts_ms) arr[i].last_ts_ms = sr->last_ts_ms;
+            arr[i].doc_count += sr->doc_count;
+            if (arr[i].title.len == 0 && sr->title.len > 0) arr[i].title = stelog_seg_str(seg, sr->title);
+            continue;
         }
-        if (merged) continue;
 
         StelogSessionSummary *dst = &arr[(*io_count)++];
         dst->session_id        = sid;
@@ -2332,8 +2672,10 @@ int stelog_index_list_sessions(StelogIndex *idx,
     if (!all) return -1;
 
     uint32_t count = 0;
-    collect_segment_sessions(&idx->base,  agent_mask, project_substr, since_ms, until_ms, all, &count);
-    collect_segment_sessions(&idx->delta, agent_mask, project_substr, since_ms, until_ms, all, &count);
+    StrMap sidmap;
+    strmap_init(&sidmap, &idx->scratch, max_sess);
+    collect_segment_sessions(&idx->base,  agent_mask, project_substr, since_ms, until_ms, &sidmap, all, &count);
+    collect_segment_sessions(&idx->delta, agent_mask, project_substr, since_ms, until_ms, &sidmap, all, &count);
 
     out->total_matches = count;
     if (count == 0 || offset >= count) {

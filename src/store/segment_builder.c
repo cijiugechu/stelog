@@ -262,8 +262,10 @@ static uint32_t interner_get_or_add(StrInterner *in, const char *s, size_t len) 
 typedef struct {
     int64_t ts_ms;
     uint64_t raw_offset;
+    uint64_t doc_key;      /* public doc_id; collisions are resolved when the segment is written */
     uint32_t raw_len;
     uint32_t src_file_idx; /* index into build file table */
+    uint32_t seq;          /* arrival order, keeps records of one JSONL line in emission order */
     StelogTag tag;
     uint8_t _pad[3];
 
@@ -509,6 +511,7 @@ static bool skip_line_prefilter(StelogAgentKind agent, const char *line, size_t 
         case STELOG_AGENT_CODEX: return stelog_codex_should_skip_line(line, len, opts->include_tool_results, opts->include_thinking);
         case STELOG_AGENT_AGY:   return stelog_agy_should_skip_line(line, len, opts->include_tool_results, opts->include_system);
         case STELOG_AGENT_PI:    return stelog_pi_should_skip_line(line, len, opts->include_tool_results);
+        case STELOG_AGENT_DROID: return stelog_droid_should_skip_line(line, len, opts->include_tool_results);
         default:                 return true;
     }
 }
@@ -553,6 +556,21 @@ static void init_chunk_ctx(const StelogFileEntry *f, const StelogMetaMap *meta, 
     }
 }
 
+static uint64_t compute_doc_key(StelogStr session_id, const char *path, uint64_t raw_offset,
+                                StelogRoleKind role, uint32_t role_ordinal) {
+    /* The file name (not the full path) keeps keys stable when transcripts are archived or moved, and
+       a ".zst" suffix is dropped because raw offsets always refer to the decompressed stream. */
+    const char *base = path ? strrchr(path, '/') : NULL;
+    base = base ? base + 1 : (path ? path : "");
+    size_t blen = strlen(base);
+    if (blen > 4 && memcmp(base + blen - 4, ".zst", 4) == 0) blen -= 4;
+    uint64_t h = stelog_wyhash(session_id.ptr ? session_id.ptr : "", session_id.len, 0x5354454C4B455931ull);
+    h = stelog_wyhash(base, blen, h);
+    uint64_t tail[2] = { raw_offset, ((uint64_t)role << 32) | role_ordinal };
+    h = stelog_wyhash(tail, sizeof(tail), h) & STELOG_DOC_KEY_MASK;
+    return h ? h : 1u;
+}
+
 static void emit_parsed_line(const ParallelIngestCtx *P,
                              StelogJsonParser *jp,
                              WorkerDocOut *Wout,
@@ -573,6 +591,8 @@ static void emit_parsed_line(const ParallelIngestCtx *P,
         rc = stelog_json_parse_codex_line(jp, line, line_len, padded_cap, f->file_id, raw_offset, &P->opts, ctx, &Wout->arena, &res);
     } else if (f->agent == STELOG_AGENT_AGY) {
         rc = stelog_json_parse_agy_line(jp, line, line_len, padded_cap, f->file_id, raw_offset, &P->opts, ctx, &Wout->arena, &res);
+    } else if (f->agent == STELOG_AGENT_DROID) {
+        rc = stelog_json_parse_droid_line(jp, line, line_len, padded_cap, f->file_id, raw_offset, &P->opts, ctx, &Wout->arena, &res);
     } else {
         rc = stelog_json_parse_pi_line(jp, line, line_len, padded_cap, f->file_id, raw_offset, &P->opts, ctx, &Wout->arena, &res);
     }
@@ -581,12 +601,21 @@ static void emit_parsed_line(const ParallelIngestCtx *P,
     StelogStr title = { "", 0 };
     StelogStr branch = { "", 0 };
     if (sm && sm->title) { title.ptr = sm->title; title.len = (uint32_t)strlen(sm->title); }
+    else if (ctx->title.len) title = ctx->title;
     if (sm && sm->git_branch) { branch.ptr = sm->git_branch; branch.len = (uint32_t)strlen(sm->git_branch); }
 
     for (uint32_t i = 0; i < res.count; ++i) {
         const StelogEvent *ev = &res.events[i];
+        /* Ordinal among same-role records of this line, so enabling tool results/thinking for a rebuild
+           does not shift the keys of the other records. */
+        StelogRoleKind role = stelog_tag_role(ev->tag);
+        uint32_t role_ord = 0;
+        for (uint32_t j = 0; j < i; ++j) {
+            if (stelog_tag_role(res.events[j].tag) == role) role_ord++;
+        }
         BuildDoc bd;
         memset(&bd, 0, sizeof(bd));
+        bd.doc_key      = compute_doc_key(ev->session_id, f->path, ev->raw_offset, role, role_ord);
         bd.ts_ms        = ev->ts_ms;
         bd.raw_offset   = ev->raw_offset;
         bd.raw_len      = ev->raw_len;
@@ -952,6 +981,8 @@ static int cmp_build_doc_ptr(const void *a, const void *b) {
     if (da->src_file_idx > db->src_file_idx) return 1;
     if (da->raw_offset < db->raw_offset) return -1;
     if (da->raw_offset > db->raw_offset) return 1;
+    if (da->seq < db->seq) return -1;
+    if (da->seq > db->seq) return 1;
     return 0;
 }
 
@@ -961,6 +992,48 @@ typedef struct {
     uint8_t is_zstd;
     uint8_t is_archived;
 } SegSrcFile;
+
+typedef struct {
+    uint64_t key;
+    uint32_t doc;
+} DocKeyPair;
+
+static int cmp_doc_key_pair(const void *a, const void *b) {
+    const DocKeyPair *pa = (const DocKeyPair *)a;
+    const DocKeyPair *pb = (const DocKeyPair *)b;
+    if (pa->key != pb->key) return pa->key < pb->key ? -1 : 1;
+    return pa->doc < pb->doc ? -1 : (pa->doc > pb->doc ? 1 : 0);
+}
+
+/* Makes keys unique within the segment and fills order[] with doc rows sorted by key. On a hash
+   collision the earlier row keeps its key and later rows are re-hashed, so the outcome depends only
+   on the segment contents. */
+static void assign_unique_doc_keys(uint64_t *keys, uint32_t *order, uint32_t doc_count) {
+    if (doc_count == 0) return;
+    DocKeyPair *pairs = (DocKeyPair *)malloc((size_t)doc_count * sizeof(DocKeyPair));
+    if (!pairs) {
+        for (uint32_t d = 0; d < doc_count; ++d) order[d] = d;
+        return;
+    }
+    for (uint32_t d = 0; d < doc_count; ++d) { pairs[d].key = keys[d]; pairs[d].doc = d; }
+    for (uint64_t salt = 1;; ++salt) {
+        qsort(pairs, doc_count, sizeof(DocKeyPair), cmp_doc_key_pair);
+        bool dup = false;
+        for (uint32_t i = 1; i < doc_count; ++i) {
+            if (pairs[i].key != pairs[i - 1].key) continue;
+            uint64_t buf[2] = { pairs[i].key, salt };
+            uint64_t k = stelog_wyhash(buf, sizeof(buf), 0x444F434B45595245ull) & STELOG_DOC_KEY_MASK;
+            pairs[i].key = k ? k : 1u;
+            dup = true;
+        }
+        if (!dup) break;
+    }
+    for (uint32_t i = 0; i < doc_count; ++i) {
+        keys[pairs[i].doc] = pairs[i].key;
+        order[i] = pairs[i].doc;
+    }
+    free(pairs);
+}
 
 static int write_segment_dir(const char *final_seg_dir,
                              const BuildDoc **sorted_docs,
@@ -998,6 +1071,8 @@ static int write_segment_dir(const char *final_seg_dir,
     uint32_t *col_file_id    = (uint32_t *)calloc(doc_count ? doc_count : 1u, sizeof(uint32_t));
     uint64_t *col_raw_off    = (uint64_t *)calloc(doc_count ? doc_count : 1u, sizeof(uint64_t));
     uint32_t *col_raw_len    = (uint32_t *)calloc(doc_count ? doc_count : 1u, sizeof(uint32_t));
+    uint64_t *col_doc_key    = (uint64_t *)calloc(doc_count ? doc_count : 1u, sizeof(uint64_t));
+    uint32_t *col_key_order  = (uint32_t *)calloc(doc_count ? doc_count : 1u, sizeof(uint32_t));
     memset(col_parent_doc, 0xFF, (doc_count ? doc_count : 1u) * sizeof(uint32_t));
 
     /* Build text.bin in RAM (contiguous UTF-8 clean text pool) */
@@ -1074,6 +1149,7 @@ static int write_segment_dir(const char *final_seg_dir,
         col_file_id[d]    = bd->src_file_idx;
         col_raw_off[d]    = bd->raw_offset;
         col_raw_len[d]    = bd->raw_len;
+        col_doc_key[d]    = bd->doc_key ? bd->doc_key : 1u;
 
         if (bd->text.len > 0) {
             bbuf_append(&text_pool, bd->text.ptr, bd->text.len);
@@ -1082,6 +1158,8 @@ static int write_segment_dir(const char *final_seg_dir,
         uint8_t nul = 0;
         bbuf_append(&text_pool, &nul, 1);
     }
+
+    assign_unique_doc_keys(col_doc_key, col_key_order, doc_count);
 
     uint32_t session_count = sess_in.count;
     uint32_t actor_count   = actor_in.count;
@@ -1126,11 +1204,13 @@ static int write_segment_dir(const char *final_seg_dir,
 
     const void *col_ptrs[STELOG_COL_COUNT] = {
         col_ts_ms, col_tag, col_project_id, col_actor_id, col_session_id,
-        col_text_off, col_text_len, col_parent_doc, col_file_id, col_raw_off, col_raw_len
+        col_text_off, col_text_len, col_parent_doc, col_file_id, col_raw_off, col_raw_len,
+        col_doc_key, col_key_order
     };
     const size_t col_elem_sz[STELOG_COL_COUNT] = {
         sizeof(int64_t), sizeof(uint8_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(uint32_t),
-        sizeof(uint64_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(uint64_t), sizeof(uint32_t)
+        sizeof(uint64_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(uint64_t), sizeof(uint32_t),
+        sizeof(uint64_t), sizeof(uint32_t)
     };
     for (int c = 0; c < STELOG_COL_COUNT; ++c) {
         bbuf_pad_to(&meta_buf, 64);
@@ -1396,6 +1476,7 @@ static int write_segment_dir(const char *final_seg_dir,
     free(col_ts_ms); free(col_tag); free(col_project_id); free(col_actor_id);
     free(col_session_id); free(col_text_off); free(col_text_len); free(col_parent_doc);
     free(col_file_id); free(col_raw_off); free(col_raw_len);
+    free(col_doc_key); free(col_key_order);
     free(sess_recs);
     bbuf_free(&text_pool);
     bbuf_free(&strpool);
@@ -1455,6 +1536,7 @@ static void import_segment_docs(const StelogSegment *seg,
         bd.ts_ms        = seg->col_ts_ms[d];
         bd.raw_offset   = seg->col_raw_off[d];
         bd.raw_len      = seg->col_raw_len[d];
+        bd.doc_key      = seg->col_doc_key[d];
         bd.src_file_idx = fmap[old_fi];
         bd.tag          = seg->col_tag[d];
         bd.session_id   = stelog_seg_str(seg, sr->session_id);
@@ -1490,6 +1572,17 @@ static void resolve_agent_home(const char *override, const char *home, const cha
  * Public Entry: stelog_index_sync (Base + Hot Delta + Incremental Manifest)
  * ============================================================================ */
 
+static void peek_current_generations(const char *cur_path, uint32_t *base_gen, uint32_t *delta_gen) {
+    int fd = open(cur_path, O_RDONLY);
+    if (fd < 0) return;
+    StelogCurrentMeta cm;
+    ssize_t got = read(fd, &cm, sizeof(cm));
+    close(fd);
+    if (got != (ssize_t)sizeof(cm) || cm.magic != STELOG_CURRENT_MAGIC) return;
+    *base_gen = cm.base_gen;
+    *delta_gen = cm.delta_gen;
+}
+
 int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_report) {
     if (!cfg) return -1;
     StelogIndexReport rep;
@@ -1512,10 +1605,11 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
 
     /* 1. Discover current source files on disk */
     const char *home = getenv("HOME");
-    char codex_dir[1024], agy_dir[1024], pi_dir[1024];
+    char codex_dir[1024], agy_dir[1024], pi_dir[1024], droid_dir[1024];
     resolve_agent_home(cfg->codex_home, home, ".codex", codex_dir, sizeof(codex_dir));
     resolve_agent_home(cfg->agy_home, home, ".gemini/antigravity-cli", agy_dir, sizeof(agy_dir));
     resolve_agent_home(cfg->pi_home, home, ".pi/agent", pi_dir, sizeof(pi_dir));
+    resolve_agent_home(cfg->droid_home, home, ".factory", droid_dir, sizeof(droid_dir));
     uint32_t mask = cfg->agent_mask ? cfg->agent_mask : ((1u << STELOG_AGENT_COUNT) - 1u);
 
     StelogFileList discovered;
@@ -1523,6 +1617,7 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     if (mask & (1u << STELOG_AGENT_CODEX)) stelog_codex_discover(codex_dir, &discovered);
     if (mask & (1u << STELOG_AGENT_AGY))   stelog_agy_discover(agy_dir, &discovered);
     if (mask & (1u << STELOG_AGENT_PI))    stelog_pi_discover(pi_dir, &discovered);
+    if (mask & (1u << STELOG_AGENT_DROID)) stelog_droid_discover(droid_dir, &discovered);
     double t_disc = stelog_now_ms();
 
     /* 2. Load existing current.meta + manifest.bin (unless force_rebuild) */
@@ -1538,6 +1633,17 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     }
 
     bool do_full_rebuild = (existing == NULL) || cfg->force_rebuild || (!existing->base.loaded);
+
+    /* Content flags are sticky so incremental syncs from callers with default options (e.g. the MCP
+       server) keep ingesting what the index was built with; newly requested content needs a full re-ingest. */
+    uint16_t content_flags = (uint16_t)((cfg->include_tool_results ? STELOG_INDEX_HAS_TOOL_RESULTS : 0u) |
+                                        (cfg->include_thinking ? STELOG_INDEX_HAS_THINKING : 0u) |
+                                        (cfg->include_system ? STELOG_INDEX_HAS_SYSTEM : 0u));
+    if (existing) {
+        uint16_t have = (uint16_t)existing->content_flags;
+        if (content_flags & ~have) do_full_rebuild = true;
+        content_flags |= have;
+    }
     uint32_t chunk_bytes = cfg->chunk_bytes ? cfg->chunk_bytes : STELOG_DEFAULT_CHUNK_BYTES;
     uint32_t nworkers = cfg->threads ? cfg->threads : stelog_detect_pcore_count();
     if (nworkers == 0) nworkers = 1;
@@ -1710,9 +1816,9 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
         pctx.tasks = tasks;
         pctx.task_count = task_count;
         pctx.opts.tool_call_max_bytes = cfg->tool_call_max_bytes ? cfg->tool_call_max_bytes : 512u;
-        pctx.opts.include_tool_results = cfg->include_tool_results;
-        pctx.opts.include_thinking = cfg->include_thinking;
-        pctx.opts.include_system = cfg->include_system;
+        pctx.opts.include_tool_results = (content_flags & STELOG_INDEX_HAS_TOOL_RESULTS) != 0;
+        pctx.opts.include_thinking = (content_flags & STELOG_INDEX_HAS_THINKING) != 0;
+        pctx.opts.include_system = (content_flags & STELOG_INDEX_HAS_SYSTEM) != 0;
         atomic_init(&pctx.next_task, 0);
         pctx.outs = wouts;
         stelog_parallel_run(run_workers, ingest_worker_fn, &pctx);
@@ -1762,9 +1868,13 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     uint32_t total_seg_docs = imported_docs.count + new_docs_count;
     const BuildDoc **ptrs = (const BuildDoc **)malloc((total_seg_docs ? total_seg_docs : 1u) * sizeof(const BuildDoc *));
     uint32_t pi = 0;
-    for (uint32_t i = 0; i < imported_docs.count; ++i) ptrs[pi++] = &imported_docs.items[i];
+    for (uint32_t i = 0; i < imported_docs.count; ++i) {
+        imported_docs.items[i].seq = pi;
+        ptrs[pi++] = &imported_docs.items[i];
+    }
     for (uint32_t w = 0; w < run_workers; ++w) {
         for (uint32_t i = 0; i < wouts[w].docs.count; ++i) {
+            wouts[w].docs.items[i].seq = pi;
             ptrs[pi++] = &wouts[w].docs.items[i];
         }
     }
@@ -1775,6 +1885,11 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
     /* 6. Write new Base (if full rebuild / compact) or Tiny Hot Delta */
     uint32_t old_base_gen  = (existing && existing->base.loaded) ? existing->base.generation : 0;
     uint32_t old_delta_gen = (existing && existing->delta.loaded) ? existing->delta.generation : 0;
+    if (!existing) {
+        /* Forced or format-upgrade rebuild: still advance past the previous generations so readers that
+           have the old segments mmapped never see files rewritten in place, and the old dirs get cleaned. */
+        peek_current_generations(cur_path, &old_base_gen, &old_delta_gen);
+    }
 
     uint32_t new_base_gen = old_base_gen;
     uint32_t new_delta_gen = old_delta_gen;
@@ -1816,6 +1931,7 @@ int stelog_index_sync(const StelogIndexConfig *cfg, StelogIndexReport *out_repor
         StelogCurrentMeta *cm = (StelogCurrentMeta *)cm_buf;
         cm->magic = STELOG_CURRENT_MAGIC;
         cm->format_version = STELOG_FORMAT_VERSION;
+        cm->flags = content_flags;
         cm->base_gen = new_base_gen;
         cm->delta_gen = new_delta_gen;
         cm->base_docs = new_base_docs;

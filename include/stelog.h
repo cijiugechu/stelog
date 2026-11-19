@@ -13,7 +13,8 @@ typedef enum {
     STELOG_AGENT_CODEX = 0,
     STELOG_AGENT_AGY   = 1,
     STELOG_AGENT_PI    = 2,
-    STELOG_AGENT_COUNT = 3
+    STELOG_AGENT_DROID = 3,
+    STELOG_AGENT_COUNT = 4
 } StelogAgentKind;
 
 typedef enum {
@@ -61,9 +62,9 @@ static inline uint8_t stelog_tag_flags(StelogTag tag) {
     return (uint8_t)(tag & 0x7u);
 }
 
-/* Composite global doc_id across Base (bit 32 = 0) and Delta (bit 32 = 1).
-   Uses bit 32 (4,294,967,296) rather than bit 63 so all doc_ids remain strictly < 2^53
-   (IEEE-754 MAX_SAFE_INTEGER) and never suffer precision rounding in JSON/JS/Protobuf MCP hosts! */
+/* Internal position of a document: Base (bit 32 = 0) or Delta (bit 32 = 1) plus the local row.
+   It changes whenever a segment is rebuilt or compacted, so it never leaves the query engine; every
+   doc_id handed to callers is the stable per-document key below. */
 static inline uint64_t stelog_make_doc_id(bool is_delta, uint32_t local_id) {
     return (is_delta ? (1ull << 32) : 0ull) | (uint64_t)local_id;
 }
@@ -73,6 +74,12 @@ static inline bool stelog_doc_is_delta(uint64_t global_id) {
 static inline uint32_t stelog_doc_local_id(uint64_t global_id) {
     return (uint32_t)(global_id & 0xFFFFFFFFull);
 }
+
+/* Public doc_ids are 48-bit keys hashed from (session id, transcript file name, line byte offset, role,
+   ordinal of that role within the line), so they survive rebuilds and Base/Delta compaction and stay
+   far below 2^53 (IEEE-754 MAX_SAFE_INTEGER) for JSON/JS MCP hosts. */
+#define STELOG_DOC_KEY_BITS 48u
+#define STELOG_DOC_KEY_MASK ((1ull << STELOG_DOC_KEY_BITS) - 1ull)
 
 /* Non-owning UTF-8 byte slice */
 typedef struct {
@@ -145,6 +152,7 @@ typedef struct {
     const char *codex_home;
     const char *agy_home;
     const char *pi_home;
+    const char *droid_home;
     uint32_t agent_mask;
     uint32_t threads;
     uint32_t chunk_bytes;
@@ -180,6 +188,7 @@ typedef struct {
     const char *codex_home;
     const char *agy_home;
     const char *pi_home;
+    const char *droid_home;
     uint32_t agent_mask;            /* 0 = all */
     uint32_t threads;               /* 0 = auto P-cores */
     uint32_t chunk_bytes;           /* 0 = 8 MiB */
@@ -226,11 +235,19 @@ void stelog_index_close(StelogIndex *idx);
 /* Reloads mmap views if current.meta changed (< 0.1 ms check). Returns 1 if reloaded, 0 if unchanged, -1 on error. */
 int stelog_index_reload_if_changed(StelogIndex *idx);
 
+/* Optional content an index was built with (sticky across incremental syncs) */
+enum {
+    STELOG_INDEX_HAS_TOOL_RESULTS = 1u << 0,
+    STELOG_INDEX_HAS_THINKING     = 1u << 1,
+    STELOG_INDEX_HAS_SYSTEM       = 1u << 2
+};
+
 typedef struct {
     uint32_t base_gen;
     uint32_t delta_gen;
     uint32_t base_docs;
     uint32_t delta_docs;
+    uint32_t content_flags;   /* STELOG_INDEX_HAS_* */
     uint32_t base_sessions;
     uint32_t delta_sessions;
     uint32_t base_terms;
@@ -287,6 +304,8 @@ typedef struct {
     uint32_t hit_count;
     uint64_t best_doc_id;
     StelogStr best_snippet;
+    float    best_score;
+    float    rank_score;  /* best_score boosted by log2(1 + hit_count); used for relevance ordering */
 } StelogSessionHit;
 
 typedef struct {
@@ -354,7 +373,8 @@ typedef struct {
 
     /* Optional --group-by session results */
     StelogSessionHit *session_groups;
-    uint32_t session_group_count;
+    uint32_t session_group_count;   /* groups on this page */
+    uint32_t session_group_total;   /* groups before offset/limit */
 
     /* Optional -l unique matching sessions */
     StelogStr *matched_sessions;
@@ -420,6 +440,21 @@ int stelog_index_context(StelogIndex *idx,
                          StelogContextResult *out);
 
 typedef struct {
+    StelogStr session_id;
+    StelogStr title;
+    StelogStr project;
+    StelogStr git_branch;
+    StelogStr parent_session_id;
+    int64_t  first_ts_ms;
+    int64_t  last_ts_ms;
+    uint32_t doc_count;
+    StelogAgentKind agent;
+    uint8_t flags;
+} StelogSessionSummary;
+
+#define STELOG_MAX_SESSION_CANDIDATES 8u
+
+typedef struct {
     StelogHit *items;
     uint32_t count;
     uint32_t total_dialogue_turns;
@@ -431,16 +466,57 @@ typedef struct {
     StelogAgentKind agent;
     bool truncated;
     double elapsed_ms;
+
+    /* Coverage: items[0] is dialogue turn #turn_offset. When omitted_count > 0, turns
+       [omitted_begin, omitted_begin + omitted_count) are not shown; items[gap_item_index]
+       (if < count) is the first item after that gap. next_offset is the turn_offset that
+       continues reading unread turns (0 when nothing was omitted). */
+    uint32_t turn_offset;
+    uint32_t gap_item_index;
+    uint32_t omitted_begin;
+    uint32_t omitted_count;
+    uint32_t next_offset;
+    int64_t  first_ts_ms;
+    int64_t  last_ts_ms;
+
+    /* Session resolution: match_count distinct sessions matched the prefix; when > 1 the call
+       returns -2 and the most recent candidates are listed here. */
+    uint32_t match_count;
+    uint32_t candidate_count;
+    StelogSessionSummary candidates[STELOG_MAX_SESSION_CANDIDATES];
 } StelogDigestResult;
+
+typedef struct {
+    const char *session;       /* full session id or (@)prefix */
+    uint32_t max_total_bytes;  /* 0 = 7200 */
+    uint32_t turn_offset;      /* first dialogue turn to show; 0 enables head+tail sampling when over budget */
+    bool include_tools;
+} StelogDigestOptions;
 
 /* Condensed chronological user<->assistant decision stream for a session (@prefix or full id).
    Collapses intermediate tool_calls to counts, deduplicates consecutive retries, and uses
-   tail-biased truncation on long assistant replies so ending options/conclusions stay intact. */
+   tail-biased truncation on long assistant replies so ending options/conclusions stay intact.
+   When the session exceeds the budget, the opening and closing turns are kept and the middle
+   is reported as an omitted range that can be paged with turn_offset.
+   Returns 0 on success, -1 when no session matches, -2 when the prefix is ambiguous. */
+int stelog_index_digest_ex(StelogIndex *idx, const StelogDigestOptions *opts, StelogDigestResult *out);
+
 int stelog_index_digest(StelogIndex *idx,
                         const char *session_prefix,
                         uint32_t max_total_bytes,
                         bool include_tools,
                         StelogDigestResult *out);
+
+/* Resolve a full session id or (@)prefix, case-insensitively. An exact full-id match wins over
+   longer ids that share it as a prefix. Returns the number of distinct matching sessions and writes
+   up to cap of them (most recent first) to out. Slices stay valid until the index reloads. */
+uint32_t stelog_index_resolve_session(const StelogIndex *idx,
+                                      const char *id_or_prefix,
+                                      StelogSessionSummary *out,
+                                      uint32_t cap);
+
+/* Shortest prefix length (at least min_len) that identifies session_id uniquely in the index. */
+uint32_t stelog_index_unique_prefix_len(const StelogIndex *idx, StelogStr session_id, uint32_t min_len);
 
 typedef struct {
     uint64_t doc_id;
@@ -468,18 +544,8 @@ int stelog_index_get_document(StelogIndex *idx,
                               bool tail_mode,
                               StelogDocResult *out);
 
-typedef struct {
-    StelogStr session_id;
-    StelogStr title;
-    StelogStr project;
-    StelogStr git_branch;
-    StelogStr parent_session_id;
-    int64_t  first_ts_ms;
-    int64_t  last_ts_ms;
-    uint32_t doc_count;
-    StelogAgentKind agent;
-    uint8_t flags;
-} StelogSessionSummary;
+/* Maps a public doc_id to its internal Base/Delta position (stelog_make_doc_id form). */
+bool stelog_index_resolve_doc_id(const StelogIndex *idx, uint64_t doc_id, uint64_t *out_internal_id);
 
 typedef struct {
     StelogSessionSummary *items;

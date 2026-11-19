@@ -1,5 +1,4 @@
 {
-  "protocolVersion": "2024-11-05",
   "capabilities": {
     "tools": {}
   },
@@ -7,5 +6,5 @@
     "name": "stelog",
     "version": "0.2.0"
   },
-  "instructions": "Recommended 2-step workflow: (1) Call search_history(query=\"term1 | term2\", group_by=\"session\", project=...) ONCE to identify relevant session(s) — do NOT call get_decision_timeline in parallel before checking sessions. (2) Call get_session_digest(session=\"@<sid8>\") to read the full condensed user<->assistant decision stream inline. (3) If you need full text of several truncated turns, call get_document(doc_ids=[id1,id2,...]) ONCE in a single batch (avoid scripting loops or guessing sequential doc_ids; use get_session_context(doc_id) for adjacent dialogue)."
+  "instructions": "Recommended 2-step workflow: (1) Call search_history(query=\"term1 | term2\", group_by=\"session\", project=...) ONCE to identify relevant session(s) — do NOT call get_decision_timeline in parallel before checking sessions. (2) Call get_session_digest(session=\"@<id>\") with the short id shown in results to read the full condensed user<->assistant decision stream inline. (3) If you need full text of several truncated turns, call get_document(doc_ids=[id1,id2,...]) ONCE in a single batch (avoid scripting loops or guessing sequential doc_ids; use get_session_context(doc_id) for adjacent dialogue)."
 }

@@ -204,6 +204,7 @@ pub fn build(b: *std.Build) void {
             "src/adapters/codex_adapter.c",
             "src/adapters/agy_adapter.c",
             "src/adapters/pi_adapter.c",
+            "src/adapters/droid_adapter.c",
             "src/store/tokenizer.c",
             "src/store/swisstable.c",
             "src/store/roaring.c",

@@ -2,13 +2,14 @@
   "tools": [
     {
       "name": "search_history",
-      "description": "Search local coding agent history (Codex CLI, AGY CLI, Pi) to pinpoint when and who made a decision. BEST FIRST STEP: call with group_by='session' (e.g. query='中文 | english', group_by='session') to locate the right session(s) cleanly, then call get_session_digest. Default searches human prompts, assistant replies, inter-agent messages, and tool calls (excluding noisy tool outputs & injected prompts).",
+      "description": "Search local coding agent history (Codex CLI, AGY CLI, Pi, Factory Droid) to pinpoint when and who made a decision. BEST FIRST STEP: call with group_by='session' (e.g. query='中文 | english', group_by='session') to locate the right session(s) cleanly, then call get_session_digest. Default searches human prompts, assistant replies, inter-agent messages, and tool calls (excluding noisy tool outputs & injected prompts).",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Keywords, `A | B` OR, `-term`/`-\"phrase\"` negation, `prefix*` wildcard, quoted phrases, or inline filters (`agent:agy role:user project:foo since:7d @sid8`)."
+            "description": "Keywords, `A | B` or `A OR B` (uppercase OR only), `-term`/`-\"phrase\"` negation, `prefix*` wildcard, quoted phrases, or inline filters (`agent:agy role:user project:foo since:7d @sid8`)."
           },
           "case": {
             "type": "string",
@@ -24,7 +25,7 @@
           },
           "agent": {
             "type": "string",
-            "description": "Comma-separated filter: codex, agy, pi."
+            "description": "Comma-separated filter: codex, agy, pi, droid."
           },
           "project": {
             "type": "string",
@@ -48,11 +49,11 @@
           },
           "since": {
             "type": "string",
-            "description": "Start time: relative (7d, 24h) or ISO-8601."
+            "description": "Start time (inclusive): relative (30m, 24h, 7d, 2w), today, yesterday, YYYY-MM-DD, or YYYY-MM-DDTHH:MM[:SS][Z|+HH:MM]. Local time unless a zone is given."
           },
           "until": {
             "type": "string",
-            "description": "End time: ISO-8601."
+            "description": "End time (inclusive, same formats as since). A date-only value covers that whole day."
           },
           "sort": {
             "type": "string",
@@ -76,32 +77,189 @@
           },
           "include_tools": {
             "type": "boolean",
-            "description": "Include tool_result records."
+            "description": "Include tool_result records (only effective when the index was built with --include-tools)."
           },
           "include_thinking": {
             "type": "boolean",
-            "description": "Include model thinking/reasoning summaries."
+            "description": "Include model thinking/reasoning summaries (only effective when the index was built with --include-thinking)."
           },
           "limit": {
             "type": "integer",
-            "description": "Max hits (default 20)."
+            "description": "Max hits or session groups (default 15)."
           },
           "offset": {
             "type": "integer",
             "description": "Pagination offset."
           }
         }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "hits",
+              "sessions",
+              "counts"
+            ],
+            "description": "hits (default), sessions (group_by=session), or counts (count_by)."
+          },
+          "total_matches": {
+            "type": "integer"
+          },
+          "shown": {
+            "type": "integer"
+          },
+          "elapsed_ms": {
+            "type": "number"
+          },
+          "hits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "doc_id",
+                "ts",
+                "session",
+                "role",
+                "snippet"
+              ]
+            }
+          },
+          "total_sessions": {
+            "type": "integer"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "last_hit_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "hit_count": {
+                  "type": "integer"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "best_doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "best_snippet": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "session",
+                "hit_count",
+                "best_doc_id"
+              ]
+            }
+          },
+          "counts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "description": "Bucket key; @session id when count_by=session."
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "last_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "count"
+              ]
+            }
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "Pass as offset to fetch the next page; absent on the last page."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "mode",
+          "total_matches"
+        ]
       }
     },
     {
       "name": "get_session_digest",
-      "description": "Return the condensed chronological user<->assistant decision stream of a single session (by @prefix or full session_id). Collapses intermediate tool calls into counts, skips duplicate retries, and keeps ending options/conclusions intact within an inline-friendly byte budget.",
+      "description": "Return the condensed chronological user<->assistant decision stream of a single session (by @prefix or full session_id). Collapses intermediate tool calls into counts, skips duplicate retries, and keeps ending options/conclusions intact within an inline-friendly byte budget. Long sessions show the opening and closing turns with the omitted middle range marked; page through it with offset. Ambiguous prefixes return the matching candidates.",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
           "session": {
             "type": "string",
             "description": "Session UUID or short @prefix (e.g. @30c3cab1)."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "First dialogue turn (#n) to show, e.g. the offset suggested by an omitted-turns marker (default 0 = head + tail overview)."
           },
           "max_bytes": {
             "type": "integer",
@@ -113,33 +271,305 @@
           }
         },
         "required": ["session"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "agent": {
+            "type": "string"
+          },
+          "first_ts": {
+            "type": "string",
+            "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+          },
+          "last_ts": {
+            "type": "string",
+            "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+          },
+          "project": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "total_turns": {
+            "type": "integer"
+          },
+          "tools_collapsed": {
+            "type": "integer"
+          },
+          "duplicates_skipped": {
+            "type": "integer"
+          },
+          "turns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "turn": {
+                  "type": "integer",
+                  "description": "Dialogue turn number (#n), usable as offset."
+                },
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "role": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Turn text, trimmed when trimmed=true (read it in full with get_document)."
+                },
+                "trimmed": {
+                  "type": "boolean"
+                },
+                "tools_before": {
+                  "type": "integer",
+                  "description": "Tool records collapsed before this turn."
+                }
+              },
+              "required": [
+                "turn",
+                "doc_id",
+                "ts",
+                "role",
+                "text"
+              ]
+            }
+          },
+          "omitted": {
+            "type": "object",
+            "properties": {
+              "from_turn": {
+                "type": "integer"
+              },
+              "to_turn": {
+                "type": "integer"
+              },
+              "next_offset": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "from_turn",
+              "to_turn",
+              "next_offset"
+            ]
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "Pass as offset to fetch the next page; absent on the last page."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "session",
+          "session_id",
+          "total_turns",
+          "turns"
+        ]
       }
     },
     {
       "name": "get_decision_timeline",
       "description": "Return chronological (oldest-first) hits across MULTIPLE sessions for a topic. Do NOT call this in parallel with search_history(group_by='session'); prefer search_history(group_by='session') -> get_session_digest when investigating a feature or single-session decision.",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
-            "description": "Topic or keyword to trace over time."
+            "description": "Topic or keyword to trace over time. Same syntax as search_history (e.g. `A | B` or `A OR B`)."
           },
-          "agent": { "type": "string" },
-          "project": { "type": "string" },
-          "role": { "type": "string" },
-          "since": { "type": "string" },
-          "until": { "type": "string" },
-          "no_subagents": { "type": "boolean" },
-          "limit": { "type": "integer" },
-          "offset": { "type": "integer" }
+          "agent": { "type": "string", "description": "Comma-separated filter: codex, agy, pi, droid." },
+          "project": { "type": "string", "description": "Substring match against project/cwd path." },
+          "role": { "type": "string", "description": "Comma-separated roles (see search_history)." },
+          "since": { "type": "string", "description": "Start time: 7d, 24h, today, YYYY-MM-DD, or ISO-8601 (local time unless zoned)." },
+          "until": { "type": "string", "description": "End time (inclusive), same formats as since." },
+          "no_subagents": { "type": "boolean", "description": "Exclude subagent transcripts." },
+          "limit": { "type": "integer", "description": "Max hits (default 10)." },
+          "offset": { "type": "integer", "description": "Pagination offset." }
         },
         "required": ["query"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "hits",
+              "sessions",
+              "counts"
+            ],
+            "description": "hits (default), sessions (group_by=session), or counts (count_by)."
+          },
+          "total_matches": {
+            "type": "integer"
+          },
+          "shown": {
+            "type": "integer"
+          },
+          "elapsed_ms": {
+            "type": "number"
+          },
+          "hits": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "snippet": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "doc_id",
+                "ts",
+                "session",
+                "role",
+                "snippet"
+              ]
+            }
+          },
+          "total_sessions": {
+            "type": "integer"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "last_hit_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "hit_count": {
+                  "type": "integer"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "best_doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "best_snippet": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "session",
+                "hit_count",
+                "best_doc_id"
+              ]
+            }
+          },
+          "counts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "key": {
+                  "type": "string",
+                  "description": "Bucket key; @session id when count_by=session."
+                },
+                "count": {
+                  "type": "integer"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "last_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "key",
+                "count"
+              ]
+            }
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "Pass as offset to fetch the next page; absent on the last page."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "mode",
+          "total_matches"
+        ]
       }
     },
     {
       "name": "get_session_context",
       "description": "Fetch surrounding dialogue turns around a matched doc_id within the same session (collapses intermediate tool calls by default).",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -153,7 +583,7 @@
           },
           "max_bytes_per_item": {
             "type": "integer",
-            "description": "Max bytes per turn (default 1800)."
+            "description": "Max bytes per turn (default 1200)."
           },
           "include_tools": {
             "type": "boolean",
@@ -161,11 +591,88 @@
           }
         },
         "required": ["doc_id"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "project": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "anchor_doc_id": {
+            "type": "integer",
+            "description": "Stable document id (survives index rebuilds)."
+          },
+          "turns": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "role": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Turn text, trimmed when trimmed=true (read it in full with get_document)."
+                },
+                "trimmed": {
+                  "type": "boolean"
+                },
+                "tools_before": {
+                  "type": "integer",
+                  "description": "Tool records collapsed before this turn."
+                },
+                "anchor": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "doc_id",
+                "ts",
+                "role",
+                "text"
+              ]
+            }
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "session",
+          "session_id",
+          "turns"
+        ]
       }
     },
     {
       "name": "get_document",
       "description": "Read full or paginated content of one or more documents (pass doc_id, OR batch doc_ids:[id1,id2,...] up to 16 in a single call instead of scripting loops), or fetch raw JSONL via O(1) pread. Note: doc_ids include hidden tool_call records and are NOT contiguous dialogue turns — use get_session_context(doc_id) for neighboring dialogue instead of guessing adjacent doc_ids.",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -195,26 +702,169 @@
             "description": "Read from the end (useful for error logs)."
           }
         }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "documents": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "offset": {
+                  "type": "integer",
+                  "description": "Byte offset of content within the document."
+                },
+                "total_bytes": {
+                  "type": "integer"
+                },
+                "content": {
+                  "type": "string"
+                },
+                "next_offset": {
+                  "type": "integer",
+                  "description": "Byte offset to pass as offset for the rest of this document."
+                },
+                "error": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "doc_id"
+              ]
+            }
+          },
+          "remaining_doc_ids": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            },
+            "description": "doc_ids not read because the batch budget ran out."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "documents"
+        ]
       }
     },
     {
       "name": "list_sessions",
-      "description": "List local Codex, AGY, and Pi sessions sorted by most recent activity, with auto-extracted titles.",
+      "description": "List local Codex, AGY, Pi, and Factory Droid sessions sorted by most recent activity, with first/last activity times, short unique @ids, and auto-extracted titles.",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
-          "agent": { "type": "string" },
-          "project": { "type": "string" },
-          "since": { "type": "string" },
-          "until": { "type": "string" },
-          "limit": { "type": "integer" },
-          "offset": { "type": "integer" }
+          "agent": { "type": "string", "description": "Comma-separated filter: codex, agy, pi, droid." },
+          "project": { "type": "string", "description": "Substring match against project/cwd path." },
+          "since": { "type": "string", "description": "Only sessions active at or after this time: 7d, 24h, today, YYYY-MM-DD, or ISO-8601." },
+          "until": { "type": "string", "description": "Only sessions active at or before this time (inclusive), same formats as since." },
+          "limit": { "type": "integer", "description": "Max sessions (default 20)." },
+          "offset": { "type": "integer", "description": "Pagination offset." }
         }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "total": {
+            "type": "integer"
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "session_id": {
+                  "type": "string"
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "first_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "last_ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "doc_count": {
+                  "type": "integer"
+                },
+                "subagent": {
+                  "type": "boolean"
+                },
+                "project": {
+                  "type": "string"
+                },
+                "title": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "session",
+                "session_id",
+                "agent",
+                "last_ts"
+              ]
+            }
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "Pass as offset to fetch the next page; absent on the last page."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "total",
+          "sessions"
+        ]
       }
     },
     {
       "name": "search_file_history",
       "description": "Find which sessions, when, and who created or edited files matching a path substring.",
+      "annotations": { "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false },
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -222,15 +872,79 @@
             "type": "string",
             "description": "File path or filename substring (e.g. rate_limit.rs or DESIGN.md)."
           },
-          "agent": { "type": "string" },
-          "project": { "type": "string" },
-          "session": { "type": "string" },
-          "since": { "type": "string" },
-          "until": { "type": "string" },
-          "no_subagents": { "type": "boolean" },
-          "limit": { "type": "integer" },
-          "offset": { "type": "integer" }
+          "agent": { "type": "string", "description": "Comma-separated filter: codex, agy, pi, droid." },
+          "project": { "type": "string", "description": "Substring match against project/cwd path." },
+          "session": { "type": "string", "description": "Exact session id or short @prefix." },
+          "since": { "type": "string", "description": "Start time: 7d, 24h, today, YYYY-MM-DD, or ISO-8601." },
+          "until": { "type": "string", "description": "End time (inclusive), same formats as since." },
+          "no_subagents": { "type": "boolean", "description": "Exclude subagent transcripts." },
+          "limit": { "type": "integer", "description": "Max file touches (default 30)." },
+          "offset": { "type": "integer", "description": "Pagination offset." }
         }
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "total_matches": {
+            "type": "integer"
+          },
+          "shown": {
+            "type": "integer"
+          },
+          "touches": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "doc_id": {
+                  "type": "integer",
+                  "description": "Stable document id (survives index rebuilds)."
+                },
+                "ts": {
+                  "type": "string",
+                  "description": "Local time with UTC offset, e.g. 2026-11-19T21:22:11+08:00; accepted by since/until."
+                },
+                "session": {
+                  "type": "string",
+                  "description": "Short unique session id (e.g. @98e6e4c2) accepted by session arguments."
+                },
+                "agent": {
+                  "type": "string"
+                },
+                "tool": {
+                  "type": "string"
+                },
+                "actor": {
+                  "type": "string"
+                },
+                "file": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "doc_id",
+                "ts",
+                "session",
+                "file"
+              ]
+            }
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "Pass as offset to fetch the next page; absent on the last page."
+          },
+          "notes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Notes and hints that also appear in the text result."
+          }
+        },
+        "required": [
+          "total_matches",
+          "touches"
+        ]
       }
     }
   ]

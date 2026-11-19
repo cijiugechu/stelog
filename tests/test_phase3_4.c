@@ -7,6 +7,7 @@
 #include "stelog_json.h"
 #include "base/arena.h"
 #include "base/simd.h"
+#include "base/time_iso8601.h"
 #include "json/json_writer.h"
 #include "query/regex_engine.h"
 #include "store/segment_builder.h"
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(cond) do { \
@@ -118,6 +120,7 @@ static void test_csift_upgrades_purification_absence_files_countby(void) {
     icfg.codex_home = codex_home;
     icfg.agy_home = agy_home;
     icfg.pi_home = pi_home;
+    icfg.droid_home = "/nonexistent/stelog-test-droid"; /* keeps ~/.factory out of fixtures */
     icfg.threads = 2;
     StelogIndexReport rep;
     CHECK(stelog_index_sync(&icfg, &rep) == 0);
@@ -174,6 +177,15 @@ static void test_csift_upgrades_purification_absence_files_countby(void) {
     q.group_by_session = true;
     CHECK(stelog_index_search(idx, &q, &sr) == 0);
     CHECK(sr.session_group_count == 2); /* deadbeef (codex) + aaaaaaaa (agy) */
+    q.query = "simdutf OR gateway";
+    CHECK(stelog_index_search(idx, &q, &sr) == 0);
+    CHECK(sr.session_group_count == 2);
+    q.query = "simdutf\tOR\tgateway";
+    CHECK(stelog_index_search(idx, &q, &sr) == 0);
+    CHECK(sr.session_group_count == 2);
+    q.query = "simdutf or gateway"; /* lowercase "or" stays a plain AND term */
+    CHECK(stelog_index_search(idx, &q, &sr) == 0);
+    CHECK(sr.session_group_count == 0);
 
     /* 7. Session digest collapses intermediate tools cleanly */
     StelogDigestResult dig;
@@ -244,6 +256,7 @@ static void test_simd_substring_and_rg_query_syntax(void) {
     icfg.codex_home = codex_home;
     icfg.agy_home = agy_home;
     icfg.pi_home = pi_home;
+    icfg.droid_home = "/nonexistent/stelog-test-droid"; /* keeps ~/.factory out of fixtures */
     icfg.threads = 2;
     CHECK(stelog_index_sync(&icfg, NULL) == 0);
 
@@ -397,10 +410,212 @@ static void test_simd_substring_and_rg_query_syntax(void) {
     printf("[PASS] test_simd_substring_and_rg_query_syntax (SIMD + negation + modifiers + smart-case + -F + prefix* + 0-malloc)\n");
 }
 
+static void test_time_args_and_utf8_writer(void) {
+    int64_t v = 0;
+    CHECK(stelog_parse_time_arg("2026-11-19T01:00:00Z", 20, false, &v));
+    CHECK(v == stelog_parse_iso8601_ms("2026-11-19T01:00:00Z", 20));
+
+    struct tm tm_mid;
+    memset(&tm_mid, 0, sizeof(tm_mid));
+    tm_mid.tm_year = 2026 - 1900; tm_mid.tm_mon = 10; tm_mid.tm_mday = 19; tm_mid.tm_isdst = -1;
+    int64_t local_midnight = (int64_t)mktime(&tm_mid) * 1000;
+    CHECK(stelog_parse_time_arg("2026-11-19", 10, false, &v) && v == local_midnight);
+    tm_mid.tm_mday = 20; tm_mid.tm_isdst = -1;
+    int64_t next_midnight = (int64_t)mktime(&tm_mid) * 1000;
+    CHECK(stelog_parse_time_arg("2026-11-19", 10, true, &v) && v == next_midnight - 1);
+
+    int64_t now_ms = (int64_t)time(NULL) * 1000;
+    CHECK(stelog_parse_time_arg("7d", 2, false, &v));
+    CHECK(v <= now_ms - 7ll * 86400000ll + 5000 && v >= now_ms - 7ll * 86400000ll - 5000);
+    CHECK(stelog_parse_time_arg("today", 5, false, &v) && v <= now_ms);
+    CHECK(!stelog_parse_time_arg("not-a-time", 10, false, &v));
+    CHECK(!stelog_parse_time_arg("", 0, false, &v));
+
+    StelogJsonWriter w;
+    stelog_jw_init(&w, 64);
+    stelog_jw_obj_begin(&w);
+    stelog_jw_kv_str(&w, "s", "ok\xff\xc3(\xe4\xb8\xad", 8); /* stray byte, truncated 2-byte seq, then a valid CJK char */
+    stelog_jw_obj_end(&w);
+    CHECK(strstr(w.buf, "ok\xEF\xBF\xBD\xEF\xBF\xBD(\xe4\xb8\xad") != NULL);
+    stelog_jw_destroy(&w);
+    printf("[PASS] test_time_args_and_utf8_writer\n");
+}
+
+static void write_droid_session(const char *dir, const char *sid, const char *title, const char *cwd,
+                                int turns, const char *extra_lines) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/%s.jsonl", dir, sid);
+    FILE *fp = fopen(path, "w");
+    CHECK(fp != NULL);
+    fprintf(fp, "{\"type\":\"session_start\",\"id\":\"%s\",\"title\":\"%s\",\"owner\":\"t\",\"version\":2,\"cwd\":\"%s\"}\n", sid, title, cwd);
+    for (int i = 0; i < turns; ++i) {
+        const char *role = (i % 2 == 0) ? "user" : "assistant";
+        fprintf(fp, "{\"type\":\"message\",\"id\":\"m%d\",\"timestamp\":\"2026-11-18T10:%02d:%02d.000Z\",\"message\":{\"role\":\"%s\",%s"
+                    "\"content\":[{\"type\":\"text\",\"text\":\"droidturn%03d padding padding padding padding padding padding padding padding "
+                    "padding padding padding padding padding padding padding padding padding padding padding padding padding\"}]}}\n",
+                i, i / 60, i % 60, role, (i % 2) ? "\"modelId\":\"claude-x\"," : "", i);
+    }
+    if (extra_lines) fputs(extra_lines, fp);
+    fclose(fp);
+}
+
+static void test_review_fixes_droid_digest_files(void) {
+    char root[] = "/tmp/stelog_fix_test_XXXXXX";
+    CHECK(mkdtemp(root) != NULL);
+    char codex_home[512], codex_sess[512], agy_home[512], agy_log[512], pi_home[512], droid_home[512], droid_dir[512], idx_dir[512];
+    snprintf(codex_home, sizeof(codex_home), "%s/codex", root);
+    snprintf(codex_sess, sizeof(codex_sess), "%s/codex/sessions/2026/11/18", root);
+    snprintf(agy_home, sizeof(agy_home), "%s/agy", root);
+    snprintf(agy_log, sizeof(agy_log), "%s/agy/brain/abcdef01-1111-2222-3333-444444444444/.system_generated/logs", root);
+    snprintf(pi_home, sizeof(pi_home), "%s/pi", root);
+    snprintf(droid_home, sizeof(droid_home), "%s/factory", root);
+    snprintf(droid_dir, sizeof(droid_dir), "%s/factory/sessions/-repos-droidproj", root);
+    snprintf(idx_dir, sizeof(idx_dir), "%s/index", root);
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "mkdir -p '%s' '%s' '%s' '%s'", codex_sess, agy_log, pi_home, droid_dir);
+    CHECK(system(cmd) == 0);
+
+    /* Codex: injected internal context must be filtered; exec-wrapped apply_patch must surface its file */
+    char f_codex[700];
+    snprintf(f_codex, sizeof(f_codex), "%s/rollout-2026-11-18T01-00-00-c0dec0de-1111-2222-3333-444444444444.jsonl", codex_sess);
+    write_str(f_codex,
+        "{\"timestamp\":\"2026-11-18T01:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"c0dec0de-1111-2222-3333-444444444444\",\"cwd\":\"/repos/codexproj\"}}\n"
+        "{\"timestamp\":\"2026-11-18T01:00:01.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"<codex_internal_context>InternalCtxNoiseToken</codex_internal_context>\"}]}}\n"
+        "{\"timestamp\":\"2026-11-18T01:00:02.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"please add the wrapped patch file\"}]}}\n"
+        "{\"timestamp\":\"2026-11-18T01:00:03.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":[\\\"apply_patch\\\",\\\"*** Begin Patch\\\\n*** Add File: src/wrapped_patch_target.c\\\\n+"
+        "int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; int f = 6; int g = 7; int h = 8; int i = 9; int j = 10; int k = 11; int l = 12; "
+        "int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; int f = 6; int g = 7; int h = 8; int i = 9; int j = 10; int k = 11; int l = 12; "
+        "int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; int f = 6; int g = 7; int h = 8; int i = 9; int j = 10; int k = 11; int l = 12; "
+        "int a = 1; int b = 2; int c = 3; int d = 4; int e = 5; int f = 6; int g = 7; int h = 8; int i = 9; int j = 10; int k = 11; int l = 12; "
+        "\\\\n*** End Patch\\\"]}\"}}\n"
+        "{\"timestamp\":\"2026-11-18T01:00:04.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"/repos/codexproj/rankprobe.md\\\"}\"}}\n"
+        "{\"timestamp\":\"2026-11-18T01:00:05.000Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"We decided the rankprobe document keeps the old layout because the migration would break three downstream readers; "
+        "the alternative of rewriting every consumer was rejected as too risky for this release, and the follow-up work is tracked separately so nothing is lost in the meantime.\"}]}}\n");
+
+    /* AGY: long content argument listed before the path argument */
+    char f_agy[700];
+    snprintf(f_agy, sizeof(f_agy), "%s/transcript.jsonl", agy_log);
+    write_str(f_agy,
+        "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"created_at\":\"2026-11-18T02:00:00Z\",\"content\":\"<USER_REQUEST>\\nwrite the long target\\n</USER_REQUEST>\"}\n"
+        "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"created_at\":\"2026-11-18T02:00:05Z\",\"tool_calls\":[{\"name\":\"write_to_file\",\"arguments\":{\"CodeContent\":\""
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        "\",\"TargetFile\":\"/repos/agyproj/long_target_after_content.rs\"}}]}\n");
+
+    /* Droid: two sessions sharing an 8-char prefix, one long enough to need head+tail sampling */
+    write_droid_session(droid_dir, "01a1b6a8-aaaa-4000-8000-000000000001", "Droid long session", "/repos/droidproj", 60,
+        "{\"type\":\"message\",\"id\":\"ctx1\",\"timestamp\":\"2026-11-18T11:00:00.000Z\",\"message\":{\"role\":\"user\",\"visibility\":\"llm_only\",\"content\":[{\"type\":\"text\",\"text\":\"<system-reminder>DroidReminderNoise</system-reminder>\"}]}}\n"
+        "{\"type\":\"message\",\"id\":\"a99\",\"timestamp\":\"2026-11-18T11:00:01.000Z\",\"message\":{\"role\":\"assistant\",\"modelId\":\"claude-x\",\"content\":[{\"type\":\"thinking\",\"thinking\":\"DroidThinkingNoise\",\"signature\":\"s\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Edit\",\"input\":{\"old_str\":\"a\",\"new_str\":\"b\",\"file_path\":\"/repos/droidproj/src/droid_edit_target.c\"}}]}}\n"
+        "{\"type\":\"message\",\"id\":\"r99\",\"timestamp\":\"2026-11-18T11:00:02.000Z\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"DroidToolResultNoise\"}]}}\n"
+        "{\"type\":\"message\",\"id\":\"__internal__system-notice__compaction:x\",\"timestamp\":\"2026-11-18T11:00:04.000Z\",\"message\":{\"role\":\"user\",\"systemNotice\":true,\"visibility\":\"user_only\",\"content\":[{\"type\":\"text\",\"text\":\"DroidCompactionNotice history compacted\"}]}}\n"
+        "{\"type\":\"todo_state\",\"id\":\"td\",\"timestamp\":\"2026-11-18T11:00:03.000Z\",\"todos\":{\"todos\":[]}}\n");
+    write_droid_session(droid_dir, "01a1b6a8-bbbb-4000-8000-000000000002", "New Session", "/repos/droidproj", 2, NULL);
+
+    StelogIndexConfig icfg;
+    memset(&icfg, 0, sizeof(icfg));
+    icfg.index_dir = idx_dir;
+    icfg.codex_home = codex_home;
+    icfg.agy_home = agy_home;
+    icfg.pi_home = pi_home;
+    icfg.droid_home = droid_home;
+    icfg.threads = 2;
+    CHECK(stelog_index_sync(&icfg, NULL) == 0);
+    StelogIndex *idx = stelog_index_open(idx_dir);
+    CHECK(idx != NULL);
+
+    StelogQuery q;
+    StelogSearchResult sr;
+    memset(&q, 0, sizeof(q));
+    q.query = "InternalCtxNoiseToken";
+    CHECK(stelog_index_search(idx, &q, &sr) == 0 && sr.total_matches == 0);
+
+    /* A short tool call naming the file must not outrank the discussion that explains it */
+    memset(&q, 0, sizeof(q));
+    q.query = "rankprobe";
+    CHECK(stelog_index_search(idx, &q, &sr) == 0 && sr.total_matches == 2);
+    CHECK(stelog_tag_role(sr.hits[0].tag) == STELOG_ROLE_ASSISTANT);
+    uint64_t assistant_doc = sr.hits[0].doc_id;
+    q.group_by_session = true;
+    CHECK(stelog_index_search(idx, &q, &sr) == 0 && sr.session_group_count == 1);
+    CHECK(sr.session_groups[0].best_doc_id == assistant_doc && sr.session_groups[0].hit_count == 2);
+
+    /* Droid content: dialogue indexed, reminders/thinking/tool output excluded by default */
+    memset(&q, 0, sizeof(q));
+    q.query = "droidturn005";
+    q.agent_mask = 1u << STELOG_AGENT_DROID;
+    CHECK(stelog_index_search(idx, &q, &sr) == 0 && sr.total_matches == 1);
+    CHECK(stelog_tag_agent(sr.hits[0].tag) == STELOG_AGENT_DROID);
+    static const char *noise[] = { "DroidReminderNoise", "DroidThinkingNoise", "DroidToolResultNoise", "DroidCompactionNotice" };
+    for (int i = 0; i < 4; ++i) {
+        memset(&q, 0, sizeof(q));
+        q.query = noise[i];
+        CHECK(stelog_index_search(idx, &q, &sr) == 0 && sr.total_matches == 0);
+    }
+
+    StelogSessionListResult sl;
+    CHECK(stelog_index_list_sessions(idx, 1u << STELOG_AGENT_DROID, NULL, 0, 0, 10, 0, &sl) == 0);
+    CHECK(sl.count == 2);
+    for (uint32_t i = 0; i < sl.count; ++i) {
+        CHECK(sl.items[i].project.len > 0 && strncmp(sl.items[i].project.ptr, "/repos/droidproj", sl.items[i].project.len) == 0);
+        if (sl.items[i].session_id.ptr[9] == 'a') CHECK(strncmp(sl.items[i].title.ptr, "Droid long session", 18) == 0);
+        else CHECK(strncmp(sl.items[i].title.ptr, "droidturn000", 12) == 0); /* placeholder title replaced */
+    }
+
+    /* File history: Droid Edit, AGY path after long content, Codex exec-wrapped patch */
+    StelogFileHistoryResult fh;
+    CHECK(stelog_index_files(idx, "droid_edit_target.c", 0, NULL, NULL, 0, 0, false, 10, 0, &fh) == 0 && fh.total_matches == 1);
+    CHECK(stelog_tag_agent(fh.items[0].tag) == STELOG_AGENT_DROID);
+    CHECK(stelog_index_files(idx, "long_target_after_content.rs", 0, NULL, NULL, 0, 0, false, 10, 0, &fh) == 0 && fh.total_matches == 1);
+    CHECK(stelog_index_files(idx, "wrapped_patch_target.c", 0, NULL, NULL, 0, 0, false, 10, 0, &fh) == 0 && fh.total_matches == 1);
+
+    /* Ambiguous prefix and unique short ids */
+    StelogDigestResult dig;
+    CHECK(stelog_index_digest(idx, "@01a1b6a8", 4096, false, &dig) == -2);
+    CHECK(dig.match_count == 2 && dig.candidate_count == 2);
+    StelogStr sid_a = { "01a1b6a8-aaaa-4000-8000-000000000001", 36 };
+    CHECK(stelog_index_unique_prefix_len(idx, sid_a, 8) == 10);
+    StelogStr sid_c = { "c0dec0de-1111-2222-3333-444444444444", 36 };
+    CHECK(stelog_index_unique_prefix_len(idx, sid_c, 8) == 8);
+    CHECK(stelog_index_digest(idx, "@nonexistent", 4096, false, &dig) == -1);
+
+    /* Head + tail sampling with a paged middle */
+    CHECK(stelog_index_digest(idx, "@01a1b6a8-A", 3000, false, &dig) == 0); /* case-insensitive prefix */
+    CHECK(dig.total_dialogue_turns == 60);
+    CHECK(dig.omitted_count > 0 && dig.gap_item_index > 0 && dig.gap_item_index < dig.count);
+    CHECK(strstr(dig.items[0].snippet.ptr, "droidturn000") != NULL);
+    CHECK(strstr(dig.items[dig.count - 1].snippet.ptr, "droidturn059") != NULL);
+    CHECK(dig.omitted_begin == dig.gap_item_index && dig.next_offset == dig.omitted_begin);
+    CHECK(dig.gap_item_index + dig.omitted_count + (dig.count - dig.gap_item_index) == 60);
+    uint32_t next = dig.next_offset;
+
+    StelogDigestOptions dopt;
+    memset(&dopt, 0, sizeof(dopt));
+    dopt.session = "01a1b6a8-aaaa-4000-8000-000000000001";
+    dopt.max_total_bytes = 3000;
+    dopt.turn_offset = next;
+    CHECK(stelog_index_digest_ex(idx, &dopt, &dig) == 0);
+    char want[32];
+    snprintf(want, sizeof(want), "droidturn%03u", next);
+    CHECK(dig.turn_offset == next && strstr(dig.items[0].snippet.ptr, want) != NULL);
+    CHECK(dig.omitted_count > 0 && dig.gap_item_index == dig.count && dig.next_offset == next + dig.count);
+
+    stelog_index_close(idx);
+    stelog_rmdir_recursive(root);
+    printf("[PASS] test_review_fixes_droid_digest_files\n");
+}
 extern const char stelog_mcp_initialize_json[];
 extern const size_t stelog_mcp_initialize_json_len;
 extern const char stelog_mcp_tools_list_json[];
 extern const size_t stelog_mcp_tools_list_json_len;
+extern const char stelog_mcp_tools_list_plain_json[];
+extern const size_t stelog_mcp_tools_list_plain_json_len;
+
+static uint32_t count_substr(const char *hay, const char *needle) {
+    uint32_t n = 0;
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + 1, needle)) n++;
+    return n;
+}
 
 static void test_embedded_mcp_schemas(void) {
     CHECK(stelog_mcp_initialize_json_len > 100);
@@ -408,7 +623,8 @@ static void test_embedded_mcp_schemas(void) {
     CHECK(strlen(stelog_mcp_initialize_json) == stelog_mcp_initialize_json_len);
     CHECK(memchr(stelog_mcp_initialize_json, '\n', stelog_mcp_initialize_json_len) == NULL);
     CHECK(memchr(stelog_mcp_initialize_json, '\r', stelog_mcp_initialize_json_len) == NULL);
-    CHECK(strstr(stelog_mcp_initialize_json, "\"protocolVersion\"") != NULL);
+    CHECK(strstr(stelog_mcp_initialize_json, "\"protocolVersion\"") == NULL); /* negotiated at runtime */
+    CHECK(stelog_mcp_initialize_json[0] == '{' && strstr(stelog_mcp_initialize_json, "\"serverInfo\"") != NULL);
     CHECK(strstr(stelog_mcp_initialize_json, "\"instructions\"") != NULL);
 
     CHECK(stelog_mcp_tools_list_json_len > 1000);
@@ -418,6 +634,15 @@ static void test_embedded_mcp_schemas(void) {
     CHECK(memchr(stelog_mcp_tools_list_json, '\r', stelog_mcp_tools_list_json_len) == NULL);
     CHECK(strstr(stelog_mcp_tools_list_json, "\"search_history\"") != NULL);
     CHECK(strstr(stelog_mcp_tools_list_json, "\"doc_ids\"") != NULL);
+    CHECK(count_substr(stelog_mcp_tools_list_json, "\"outputSchema\"") == 7);
+
+    /* Plain variant (for Codex) drops every outputSchema and nothing else */
+    CHECK(strlen(stelog_mcp_tools_list_plain_json) == stelog_mcp_tools_list_plain_json_len);
+    CHECK(count_substr(stelog_mcp_tools_list_plain_json, "\"outputSchema\"") == 0);
+    CHECK(count_substr(stelog_mcp_tools_list_plain_json, "\"inputSchema\"") == 7);
+    CHECK(count_substr(stelog_mcp_tools_list_plain_json, "\"annotations\"") == 7);
+    CHECK(stelog_mcp_tools_list_plain_json[0] == '{' &&
+          strcmp(stelog_mcp_tools_list_plain_json + stelog_mcp_tools_list_plain_json_len - 3, "}]}") == 0);
     printf("[PASS] test_embedded_mcp_schemas (init=%zuB, tools=%zuB, single-line NDJSON safe)\n",
            stelog_mcp_initialize_json_len, stelog_mcp_tools_list_json_len);
 }
@@ -428,6 +653,8 @@ int main(void) {
     test_embedded_mcp_schemas();
     test_csift_upgrades_purification_absence_files_countby();
     test_simd_substring_and_rg_query_syntax();
+    test_time_args_and_utf8_writer();
+    test_review_fixes_droid_digest_files();
     printf("All Phase 3 & 4 unit & integration tests passed!\n");
     return 0;
 }

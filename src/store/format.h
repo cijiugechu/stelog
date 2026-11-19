@@ -12,7 +12,7 @@ extern "C" {
 #define STELOG_INDEX_MAGIC      0x474C5453u /* 'STLG' */
 #define STELOG_MANIFEST_MAGIC   0x4E4D5453u /* 'STMN' */
 #define STELOG_CURRENT_MAGIC    0x52435453u /* 'STCR' */
-#define STELOG_FORMAT_VERSION   2u
+#define STELOG_FORMAT_VERSION   4u
 
 /* Column indices in meta.col */
 enum {
@@ -27,10 +27,12 @@ enum {
     STELOG_COL_FILE_ID     = 8,  /* uint32_t[doc_count] */
     STELOG_COL_RAW_OFF     = 9,  /* uint64_t[doc_count] */
     STELOG_COL_RAW_LEN     = 10, /* uint32_t[doc_count] */
-    STELOG_COL_COUNT       = 11
+    STELOG_COL_DOC_KEY     = 11, /* uint64_t[doc_count]: public doc_id (see stelog_doc_key_*) */
+    STELOG_COL_KEY_ORDER   = 12, /* uint32_t[doc_count]: local doc ids sorted by DOC_KEY */
+    STELOG_COL_COUNT       = 13
 };
 
-/* Fixed 128-byte, 64-byte aligned header at start of meta.col */
+/* Fixed 192-byte, 64-byte aligned header at start of meta.col */
 typedef struct {
     uint32_t magic;
     uint16_t format_version;
@@ -42,10 +44,10 @@ typedef struct {
     uint32_t file_count;
     uint32_t avg_text_len;
     uint64_t col_offsets[STELOG_COL_COUNT]; /* each 64-byte aligned */
-    uint8_t  _reserved[8];
+    uint8_t  _reserved[56];
 } StelogMetaHeader;
 
-_Static_assert(sizeof(StelogMetaHeader) == 128, "StelogMetaHeader must be 128 bytes");
+_Static_assert(sizeof(StelogMetaHeader) == 192, "StelogMetaHeader must be 192 bytes");
 
 /* String slice stored inside dict.bin string pool */
 typedef struct {
@@ -181,7 +183,7 @@ typedef struct {
 typedef struct {
     uint32_t magic;
     uint16_t format_version;
-    uint16_t flags;
+    uint16_t flags;         /* STELOG_INDEX_HAS_* content flags the index was built with */
     uint32_t base_gen;      /* 0 if none */
     uint32_t delta_gen;     /* 0 if none */
     uint32_t base_docs;

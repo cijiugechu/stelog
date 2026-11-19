@@ -768,8 +768,9 @@ void stelog_parse_query_plan_ex(const char *query,
             if (query[i] == '|') {
                 is_split = true;
                 skip = 1;
-            } else if (i + 4 <= len && query[i] == ' ' && query[i + 1] == 'O' &&
-                       query[i + 2] == 'R' && query[i + 3] == ' ') {
+            } else if (i + 4 <= len && (query[i] == ' ' || query[i] == '\t') &&
+                       query[i + 1] == 'O' && query[i + 2] == 'R' &&
+                       (query[i + 3] == ' ' || query[i + 3] == '\t')) {
                 is_split = true;
                 skip = 4;
             }

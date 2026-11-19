@@ -20,6 +20,7 @@ typedef struct {
     StelogStr cwd;
     StelogStr actor;
     StelogStr parent_session_id;
+    StelogStr title;          /* session title when the transcript carries one (Droid session_start) */
     uint8_t session_flags;
 } StelogStreamContext;
 
@@ -80,6 +81,17 @@ int stelog_json_parse_pi_line(StelogJsonParser *parser,
                               StelogArena *arena,
                               StelogLineResult *out);
 
+int stelog_json_parse_droid_line(StelogJsonParser *parser,
+                                 const char *line,
+                                 size_t line_len,
+                                 size_t padded_cap,
+                                 uint32_t file_id,
+                                 uint64_t raw_offset,
+                                 const StelogParseOptions *opts,
+                                 StelogStreamContext *ctx,
+                                 StelogArena *arena,
+                                 StelogLineResult *out);
+
 /* ============================================================================
  * MCP JSON-RPC 2.0 Request Parser (powered by simdjson On-Demand)
  * ============================================================================ */
@@ -115,6 +127,8 @@ typedef struct {
     StelogStr arg_group_by;
     StelogStr arg_file;
     StelogStr arg_case;
+    StelogStr protocol_version;   /* initialize: params.protocolVersion */
+    StelogStr client_name;        /* initialize: params.clientInfo.name */
 
     uint64_t arg_doc_id;
     bool     has_doc_id;

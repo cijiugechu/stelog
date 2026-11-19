@@ -51,6 +51,8 @@ typedef struct {
     const uint32_t *col_file_id;
     const uint64_t *col_raw_off;
     const uint32_t *col_raw_len;
+    const uint64_t *col_doc_key;
+    const uint32_t *col_key_order;
 
     /* Zero-copy pointers into dict.bin */
     const StelogSessionRecord *sessions;
@@ -89,6 +91,7 @@ struct StelogIndex {
     uint64_t current_inode;
     int64_t  current_mtime_ns;
     int64_t  updated_at_ms;
+    uint32_t content_flags;   /* STELOG_INDEX_HAS_* from current.meta */
 
     StelogSegment base;
     StelogSegment delta;

@@ -4,6 +4,7 @@
 #include "base/time_iso8601.h"
 #include "json/json_writer.h"
 #include "query/regex_engine.h"
+#include "store/segment_reader.h"
 #include "store/tokenizer.h"
 
 #include <inttypes.h>
@@ -50,7 +51,7 @@ static void print_usage(void) {
     printf("stelog 0.2.0 - Fast DOD coding-agent history search, decision archaeology & MCP server\n\n"
            "Usage:\n"
            "  stelog search <query> [TARGET] [flags]   Search decisions (`A | B`, `-term`, `prefix*`, inline `agent:`)\n"
-           "  stelog digest @<session> [--budget N]    Condensed user<->assistant decision stream of a session\n"
+           "  stelog digest @<session> [--budget N] [--offset T]  Condensed user<->assistant decision stream of a session\n"
            "  stelog timeline <query> [TARGET] [flags] Chronological (oldest-first) decision timeline\n"
            "  stelog files [file_substr] [TARGET]      Find who edited/created a file and when\n"
            "  stelog context <doc_id> [-w N] [--json]  Show surrounding dialogue turns (collapses tools by default)\n"
@@ -77,7 +78,7 @@ static void print_usage(void) {
            "  -F, --fixed-strings       Literal substring search (disables syntax/wildcard parsing)\n"
            "  -E, --regex, -P           PCRE2 JIT regex search (auto literal/SwissTable prefilter)\n"
            "  -C <N> / -B <N> / -A <N>  Show N surrounding dialogue turns around each search hit\n"
-           "  --agent <csv>             codex, agy, pi (repeatable)\n"
+           "  --agent <csv>             codex, agy, pi, droid (repeatable)\n"
            "  -t, --role <csv>          user, assistant, inter_agent, tool_call, tool_result, thinking, system\n"
            "  -T, --exclude-role <csv>  Exclude specified roles\n"
            "  --project <substr>        Match project/cwd substring\n"
@@ -109,21 +110,17 @@ static void fmt_ts(int64_t ts_ms, char *out, size_t cap) {
     strftime(out, cap, "%Y-%m-%d %H:%M:%S", &tm_buf);
 }
 
-static int64_t parse_since_arg(const char *s) {
+static int64_t parse_time_arg_or_exit(const char *flag, const char *s, bool end_of_range) {
     if (!s || !s[0]) return 0;
-    size_t len = strlen(s);
-    if (len >= 2 && (s[len - 1] == 'd' || s[len - 1] == 'h')) {
-        char *end = NULL;
-        long val = strtol(s, &end, 10);
-        if (end == s + len - 1 && val > 0) {
-            struct timespec ts;
-            clock_gettime(CLOCK_REALTIME, &ts);
-            int64_t now_ms = (int64_t)ts.tv_sec * 1000ll + ts.tv_nsec / 1000000ll;
-            int64_t delta = (s[len - 1] == 'd') ? (val * 86400ll * 1000ll) : (val * 3600ll * 1000ll);
-            return now_ms - delta;
-        }
+    int64_t ms = 0;
+    if (!stelog_parse_time_arg(s, strlen(s), end_of_range, &ms)) {
+        fprintf(stderr,
+                "stelog: invalid %s value '%s'. Use 30m/24h/7d/2w, today, yesterday, YYYY-MM-DD, "
+                "or YYYY-MM-DDTHH:MM[:SS] (local time unless Z or +HH:MM is given).\n",
+                flag, s);
+        exit(2);
     }
-    return stelog_parse_iso8601_ms(s, len);
+    return ms;
 }
 
 static uint32_t parse_agent_csv(const char *s) {
@@ -135,6 +132,7 @@ static uint32_t parse_agent_csv(const char *s) {
         if (l == 5 && memcmp(p, "codex", 5) == 0) mask |= (1u << STELOG_AGENT_CODEX);
         else if (l == 3 && memcmp(p, "agy", 3) == 0) mask |= (1u << STELOG_AGENT_AGY);
         else if (l == 2 && memcmp(p, "pi", 2) == 0) mask |= (1u << STELOG_AGENT_PI);
+        else if (l == 5 && memcmp(p, "droid", 5) == 0) mask |= (1u << STELOG_AGENT_DROID);
         if (!c) break;
         p = c + 1;
     }
@@ -439,8 +437,8 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
         else if (!end_of_opts && strcmp(argv[i], "--project") == 0 && i + 1 < argc) q.project_substr = argv[++i];
         else if (!end_of_opts && strcmp(argv[i], "--actor") == 0 && i + 1 < argc) q.actor_substr = argv[++i];
         else if (!end_of_opts && strcmp(argv[i], "--session") == 0 && i + 1 < argc) q.session_id = argv[++i];
-        else if (!end_of_opts && strcmp(argv[i], "--since") == 0 && i + 1 < argc) q.since_ms = parse_since_arg(argv[++i]);
-        else if (!end_of_opts && strcmp(argv[i], "--until") == 0 && i + 1 < argc) q.until_ms = parse_since_arg(argv[++i]);
+        else if (!end_of_opts && strcmp(argv[i], "--since") == 0 && i + 1 < argc) q.since_ms = parse_time_arg_or_exit("--since", argv[++i], false);
+        else if (!end_of_opts && strcmp(argv[i], "--until") == 0 && i + 1 < argc) q.until_ms = parse_time_arg_or_exit("--until", argv[++i], true);
         else if (!end_of_opts && strcmp(argv[i], "--limit") == 0 && i + 1 < argc) q.limit = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!end_of_opts && strcmp(argv[i], "--offset") == 0 && i + 1 < argc) q.offset = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (!end_of_opts && strcmp(argv[i], "--first") == 0 && i + 1 < argc) {
@@ -599,7 +597,7 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
         for (uint32_t i = 0; i < sr.session_group_count; ++i) {
             const StelogSessionHit *g = &sr.session_groups[i];
             fmt_ts(g->last_hit_ts_ms, tbuf, sizeof(tbuf));
-            uint32_t sid_s = g->session_id.len > 8 ? 8 : g->session_id.len;
+            uint32_t sid_s = stelog_index_unique_prefix_len(idx, g->session_id, 8);
             printf("%s@%.*s%s [%-5s %s%s%s] %s(%u hits)%s | %s%.*s%s | %s%.*s%s\n  %sbest doc=%" PRIu64 ":%s ",
                    C_BLUE, (int)sid_s, g->session_id.ptr, C_RESET,
                    stelog_agent_name(g->agent), C_DIM, tbuf, C_RESET,
@@ -623,7 +621,7 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
         for (uint32_t i = 0; i < sr.bucket_count; ++i) {
             if (q.count_by == STELOG_COUNT_BY_SESSION) {
                 fmt_ts(sr.buckets[i].meta_last_ts_ms, tbuf, sizeof(tbuf));
-                uint32_t sid_s = sr.buckets[i].key.len > 8 ? 8 : sr.buckets[i].key.len;
+                uint32_t sid_s = stelog_index_unique_prefix_len(idx, sr.buckets[i].key, 8);
                 printf("%6u  %s@%.*s%s [%-5s %s] %.*s\n",
                        sr.buckets[i].count,
                        C_BLUE, (int)sid_s, sr.buckets[i].key.ptr, C_RESET,
@@ -658,7 +656,7 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
             uint32_t hi_i = cr.anchor_index + ctx_after;
             if (hi_i >= cr.count) hi_i = cr.count - 1u;
 
-            uint32_t sid_s = cr.session_id.len > 8 ? 8 : cr.session_id.len;
+            uint32_t sid_s = stelog_index_unique_prefix_len(idx, cr.session_id, 8);
             printf("%s@%.*s%s | %s%.*s%s", C_BLUE, (int)sid_s, cr.session_id.ptr, C_RESET,
                    C_DIM, (int)cr.project.len, cr.project.ptr, C_RESET);
             if (dup_cnts[i] > 0) printf(" %s(+%u dup)%s", C_YELLOW, dup_cnts[i], C_RESET);
@@ -690,7 +688,7 @@ static int cmd_search_or_timeline(int argc, char **argv, bool is_timeline) {
             const StelogHit *h = &sr.hits[i];
             StelogRoleKind rk = stelog_tag_role(h->tag);
             fmt_ts(h->ts_ms, tbuf, sizeof(tbuf));
-            uint32_t sid_s = h->session_id.len > 8 ? 8 : h->session_id.len;
+            uint32_t sid_s = stelog_index_unique_prefix_len(idx, h->session_id, 8);
             printf("%s[%s]%s %sdoc=%" PRIu64 "%s %s@%.*s%s | %s%s/%s%s | actor=%.*s | %s%.*s%s",
                    C_DIM, tbuf, C_RESET,
                    C_BOLD, h->doc_id, C_RESET,
@@ -725,8 +723,8 @@ static int cmd_files(int argc, char **argv) {
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) agent_mask |= parse_agent_csv(argv[++i]);
         else if (strcmp(argv[i], "--project") == 0 && i + 1 < argc) proj = argv[++i];
         else if (strcmp(argv[i], "--session") == 0 && i + 1 < argc) sess = argv[++i];
-        else if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) since = parse_since_arg(argv[++i]);
-        else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc) until = parse_since_arg(argv[++i]);
+        else if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) since = parse_time_arg_or_exit("--since", argv[++i], false);
+        else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc) until = parse_time_arg_or_exit("--until", argv[++i], true);
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) limit = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) offset = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--no-subagents") == 0) no_subagents = true;
@@ -781,7 +779,7 @@ static int cmd_files(int argc, char **argv) {
     for (uint32_t i = 0; i < fh.count; ++i) {
         const StelogFileTouch *ft = &fh.items[i];
         fmt_ts(ft->ts_ms, tbuf, sizeof(tbuf));
-        uint32_t sid_s = ft->session_id.len > 8 ? 8 : ft->session_id.len;
+        uint32_t sid_s = stelog_index_unique_prefix_len(idx, ft->session_id, 8);
         printf("%s[%s]%s %sdoc=%" PRIu64 "%s %s@%.*s%s | %-5s | %s%-11.*s%s | %.*s | %s%.*s%s\n",
                C_DIM, tbuf, C_RESET,
                C_BOLD, ft->doc_id, C_RESET,
@@ -861,12 +859,13 @@ static int cmd_context(int argc, char **argv) {
 }
 
 static int cmd_digest(int argc, char **argv) {
-    if (argc < 3) { fprintf(stderr, "Usage: stelog digest @<session-prefix> [--budget N] [--include-tools] [--json]\n"); return 1; }
+    if (argc < 3) { fprintf(stderr, "Usage: stelog digest @<session-prefix> [--budget N] [--offset TURN] [--include-tools] [--json]\n"); return 1; }
     const char *sess = NULL, *index_dir = NULL;
-    uint32_t budget = 14336;
+    uint32_t budget = 14336, turn_offset = 0;
     bool include_tools = false, no_sync = false, json_out = false;
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--budget") == 0 && i + 1 < argc) budget = (uint32_t)strtoul(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) turn_offset = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--include-tools") == 0) include_tools = true;
         else if (strcmp(argv[i], "--no-sync") == 0) no_sync = true;
         else if (strcmp(argv[i], "--json") == 0) json_out = true;
@@ -877,8 +876,31 @@ static int cmd_digest(int argc, char **argv) {
     if (!sess) { fprintf(stderr, "Missing session id or @prefix.\n"); return 1; }
     StelogIndex *idx = open_with_optional_sync(index_dir, no_sync);
     if (!idx) return 1;
+    StelogDigestOptions dopts;
+    memset(&dopts, 0, sizeof(dopts));
+    dopts.session = sess;
+    dopts.max_total_bytes = budget;
+    dopts.turn_offset = turn_offset;
+    dopts.include_tools = include_tools;
     StelogDigestResult dr;
-    if (stelog_index_digest(idx, sess, budget, include_tools, &dr) != 0) {
+    int drc = stelog_index_digest_ex(idx, &dopts, &dr);
+    if (drc == -2) {
+        fprintf(stderr, "Ambiguous session prefix '%s': %u sessions match. Use a longer prefix:\n", sess, dr.match_count);
+        char t1[32], t2[32];
+        for (uint32_t i = 0; i < dr.candidate_count; ++i) {
+            const StelogSessionSummary *c = &dr.candidates[i];
+            fmt_ts(c->first_ts_ms, t1, sizeof(t1));
+            fmt_ts(c->last_ts_ms, t2, sizeof(t2));
+            uint32_t sl = stelog_index_unique_prefix_len(idx, c->session_id, 8);
+            fprintf(stderr, "  @%.*s [%s %s .. %s] %u docs | %.*s | %.*s\n",
+                    (int)sl, c->session_id.ptr, stelog_agent_name(c->agent), t1, t2, c->doc_count,
+                    (int)c->project.len, c->project.ptr, (int)c->title.len, c->title.ptr);
+        }
+        if (dr.match_count > dr.candidate_count) fprintf(stderr, "  ... and %u more\n", dr.match_count - dr.candidate_count);
+        stelog_index_close(idx);
+        return 2;
+    }
+    if (drc != 0) {
         fprintf(stderr, "Session '%s' not found.\n", sess);
         stelog_index_close(idx);
         return 1;
@@ -896,6 +918,13 @@ static int cmd_digest(int argc, char **argv) {
         stelog_jw_kv_u64(&w, "total_tools_collapsed", dr.total_tools_collapsed);
         stelog_jw_kv_u64(&w, "duplicates_skipped", dr.duplicates_skipped);
         stelog_jw_kv_bool(&w, "truncated", dr.truncated);
+        stelog_jw_kv_int(&w, "first_ts_ms", dr.first_ts_ms);
+        stelog_jw_kv_int(&w, "last_ts_ms", dr.last_ts_ms);
+        stelog_jw_kv_u64(&w, "turn_offset", dr.turn_offset);
+        stelog_jw_kv_u64(&w, "gap_item_index", dr.gap_item_index);
+        stelog_jw_kv_u64(&w, "omitted_begin", dr.omitted_begin);
+        stelog_jw_kv_u64(&w, "omitted_count", dr.omitted_count);
+        stelog_jw_kv_u64(&w, "next_offset", dr.next_offset);
         stelog_jw_kv_double(&w, "elapsed_ms", dr.elapsed_ms);
         stelog_jw_key(&w, "items");
         stelog_jw_arr_begin(&w);
@@ -908,31 +937,46 @@ static int cmd_digest(int argc, char **argv) {
         return 0;
     }
 
-    printf("%sDigest @%.*s [%s] | proj=%.*s | %u/%u dialogue turns (%u tools collapsed, %u retries deduped, %.3f ms)%s\n\n",
-           C_DIM, (int)dr.session_id.len, dr.session_id.ptr,
-           stelog_agent_name(dr.agent),
+    char tbuf[32], tbuf2[32];
+    fmt_ts(dr.first_ts_ms, tbuf, sizeof(tbuf));
+    fmt_ts(dr.last_ts_ms, tbuf2, sizeof(tbuf2));
+    uint32_t dsl = stelog_index_unique_prefix_len(idx, dr.session_id, 8);
+    printf("%sDigest @%.*s [%s] %s .. %s | proj=%.*s | %u/%u dialogue turns (%u tools collapsed, %u retries deduped, %.3f ms)%s\n\n",
+           C_DIM, (int)dsl, dr.session_id.ptr,
+           stelog_agent_name(dr.agent), tbuf, tbuf2,
            (int)dr.project.len, dr.project.ptr,
            dr.count, dr.total_dialogue_turns,
            dr.total_tools_collapsed, dr.duplicates_skipped, dr.elapsed_ms, C_RESET);
 
-    char tbuf[32];
     for (uint32_t i = 0; i < dr.count; ++i) {
         const StelogHit *h = &dr.items[i];
         StelogRoleKind rk = stelog_tag_role(h->tag);
+        bool after_gap = dr.omitted_count > 0 && i >= dr.gap_item_index;
+        if (dr.omitted_count > 0 && i == dr.gap_item_index) {
+            printf("  %s[... %u turns omitted (#%u-#%u): `stelog digest @%.*s --offset %u`]%s\n", C_YELLOW,
+                   dr.omitted_count, dr.omitted_begin, dr.omitted_begin + dr.omitted_count - 1u,
+                   (int)dsl, dr.session_id.ptr, dr.next_offset, C_RESET);
+        }
+        uint32_t turn_no = after_gap ? dr.omitted_begin + dr.omitted_count + (i - dr.gap_item_index) : dr.turn_offset + i;
         if (h->collapsed_tools_before > 0) {
             printf("  %s[...%u tool calls]%s\n", C_DIM, h->collapsed_tools_before, C_RESET);
         }
         fmt_ts(h->ts_ms, tbuf, sizeof(tbuf));
-        printf("%s[%s]%s %sdoc=%" PRIu64 "%s %s%s%s (%.*s): ",
-               C_DIM, tbuf, C_RESET,
+        printf("%s#%u [%s]%s %sdoc=%" PRIu64 "%s %s%s%s (%.*s): ",
+               C_DIM, turn_no, tbuf, C_RESET,
                C_BOLD, h->doc_id, C_RESET,
                role_color(rk), stelog_role_name(rk), C_RESET,
                (int)h->actor.len, h->actor.ptr);
         print_sanitized(h->snippet.ptr, h->snippet.len);
         putchar('\n');
     }
+    if (dr.omitted_count > 0 && dr.gap_item_index >= dr.count) {
+        printf("\n%s[... %u more turns (#%u-#%u): `stelog digest @%.*s --offset %u`]%s\n", C_YELLOW,
+               dr.omitted_count, dr.omitted_begin, dr.omitted_begin + dr.omitted_count - 1u,
+               (int)dsl, dr.session_id.ptr, dr.next_offset, C_RESET);
+    }
     if (dr.truncated) {
-        printf("\n%s[truncated at budget=%uB: use `stelog show <doc_id>` or `--budget N` for more]%s\n", C_DIM, budget, C_RESET);
+        printf("\n%s[long turns trimmed at budget=%uB: use `stelog show <doc_id>` or `--budget N` for more]%s\n", C_DIM, budget, C_RESET);
     }
     stelog_index_close(idx);
     return 0;
@@ -1010,8 +1054,8 @@ static int cmd_sessions(int argc, char **argv) {
     for (int i = 2; i < argc; ++i) {
         if (strcmp(argv[i], "--agent") == 0 && i + 1 < argc) agent_mask |= parse_agent_csv(argv[++i]);
         else if (strcmp(argv[i], "--project") == 0 && i + 1 < argc) proj = argv[++i];
-        else if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) since = parse_since_arg(argv[++i]);
-        else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc) until = parse_since_arg(argv[++i]);
+        else if (strcmp(argv[i], "--since") == 0 && i + 1 < argc) since = parse_time_arg_or_exit("--since", argv[++i], false);
+        else if (strcmp(argv[i], "--until") == 0 && i + 1 < argc) until = parse_time_arg_or_exit("--until", argv[++i], true);
         else if (strcmp(argv[i], "--limit") == 0 && i + 1 < argc) limit = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--offset") == 0 && i + 1 < argc) offset = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--no-sync") == 0) no_sync = true;
@@ -1053,14 +1097,15 @@ static int cmd_sessions(int argc, char **argv) {
         return 0;
     }
 
-    printf("%sSessions: %u total (showing %u, %.3f ms)%s\n\n", C_DIM, sl.total_matches, sl.count, sl.elapsed_ms, C_RESET);
-    char tbuf[32];
+    printf("%sSessions: %u total (showing %u, %.3f ms; first .. last activity)%s\n\n", C_DIM, sl.total_matches, sl.count, sl.elapsed_ms, C_RESET);
+    char tbuf[32], tbuf2[32];
     for (uint32_t i = 0; i < sl.count; ++i) {
         const StelogSessionSummary *s = &sl.items[i];
-        fmt_ts(s->last_ts_ms, tbuf, sizeof(tbuf));
-        uint32_t sid_s = s->session_id.len > 8 ? 8 : s->session_id.len;
-        printf("%s[%s]%s %-5s %4u docs | %s@%.*s%s | %s%.*s%s | %.*s\n",
-               C_DIM, tbuf, C_RESET,
+        fmt_ts(s->first_ts_ms, tbuf, sizeof(tbuf));
+        fmt_ts(s->last_ts_ms, tbuf2, sizeof(tbuf2));
+        uint32_t sid_s = stelog_index_unique_prefix_len(idx, s->session_id, 8);
+        printf("%s[%s .. %s]%s %-5s %4u docs | %s@%.*s%s | %s%.*s%s | %.*s\n",
+               C_DIM, tbuf, tbuf2, C_RESET,
                stelog_agent_name(s->agent), s->doc_count,
                C_BLUE, (int)sid_s, s->session_id.ptr, C_RESET,
                C_DIM, (int)s->project.len, s->project.ptr, C_RESET,
@@ -1247,7 +1292,7 @@ static int cmd_bench(int argc, char **argv) {
         sample_sid[copy] = '\0';
     }
     if (st.base_docs > 0) {
-        sample_doc = stelog_make_doc_id(false, st.base_docs / 2u);
+        sample_doc = idx->base.col_doc_key[st.base_docs / 2u];
         has_sample_doc = true;
     }
     if (has_sample_doc && sample_sid[0]) {

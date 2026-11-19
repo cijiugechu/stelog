@@ -92,6 +92,8 @@ int stelog_segment_open(const char *seg_dir, uint32_t generation, StelogSegment 
     out->col_file_id    = (const uint32_t *)(mb + mh->col_offsets[STELOG_COL_FILE_ID]);
     out->col_raw_off    = (const uint64_t *)(mb + mh->col_offsets[STELOG_COL_RAW_OFF]);
     out->col_raw_len    = (const uint32_t *)(mb + mh->col_offsets[STELOG_COL_RAW_LEN]);
+    out->col_doc_key    = (const uint64_t *)(mb + mh->col_offsets[STELOG_COL_DOC_KEY]);
+    out->col_key_order  = (const uint32_t *)(mb + mh->col_offsets[STELOG_COL_KEY_ORDER]);
 
     /* Hint kernel to keep hot metadata columns resident */
     madvise(out->f_meta.base, out->f_meta.len, MADV_WILLNEED);
@@ -263,6 +265,7 @@ static int load_current_into(StelogIndex *idx) {
     idx->current_inode = (uint64_t)st.st_ino;
     idx->current_mtime_ns = stat_mtime_ns(&st);
     idx->updated_at_ms = cm->updated_at_ms;
+    idx->content_flags = cm->flags;
 
     free(buf);
     return 0;
@@ -307,6 +310,7 @@ void stelog_index_get_stats(const StelogIndex *idx, StelogIndexStats *out) {
     memset(out, 0, sizeof(*out));
     if (!idx) return;
     out->updated_at_ms = idx->updated_at_ms;
+    out->content_flags = idx->content_flags;
     if (idx->base.loaded) {
         out->base_gen        = idx->base.generation;
         out->base_docs       = idx->base.doc_count;

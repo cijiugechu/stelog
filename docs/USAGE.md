@@ -7,7 +7,7 @@ Practical cheatsheet for the `stelog` CLI and MCP Server.
 | Goal | Command |
 | :--- | :--- |
 | Find which session(s) decided X *(best first step)* | `stelog search "X \| Y" . --group-by session` |
-| Read a session's condensed decision stream | `stelog digest @<sid8> [--budget 14336]` |
+| Read a session's condensed decision stream | `stelog digest @<id> [--budget 14336] [--offset N]` |
 | Trace how a topic evolved over time | `stelog timeline "X \| Y" .` |
 | Find who created or edited a file | `stelog files roaring.c .` |
 | See surrounding dialogue right inside search | `stelog search "X" . -C 2` |
@@ -39,7 +39,7 @@ Modifiers work inside `<query>` in both CLI and MCP `search_history`:
 - `project:<substr>` (or `proj:<substr>`) — project/cwd substring
 - `actor:<substr>` — actor/model substring
 - `session:<prefix>` or `@<4+hex>` — session UUID prefix (e.g. `@30c3cab1`; non-hex `@Override` is treated as normal text)
-- `since:<val>` / `until:<val>` — relative (`7d`, `24h`) or ISO-8601 (`2026-11-01T00:00:00Z`)
+- `since:<val>` / `until:<val>` — relative (`30m`, `24h`, `7d`, `2w`), `today`, `yesterday`, `YYYY-MM-DD`, or ISO-8601 (`2026-11-01T00:00:00Z`; local time when no zone is given). `until` is inclusive: a date-only value covers the whole day. Invalid values are reported as errors.
 
 ```bash
 stelog search "agent:agy role:user project:unicus since:7d 镜像 -docker"
@@ -79,7 +79,7 @@ Common flags for `search` / `timeline`:
 | `-T, --exclude-role <csv>` | Exclude roles |
 | `--no-subagents` | Exclude subagent transcripts |
 | `--include-tools` / `--include-thinking` | Also search `tool_result` / `thinking` (if indexed) |
-| `--since <7d\|24h\|ISO8601>` / `--until <ISO8601>` | Time window filter |
+| `--since <7d\|24h\|today\|YYYY-MM-DD\|ISO8601>` / `--until <same>` | Time window filter (inclusive; invalid values exit with code 2) |
 | `-C <N>` / `-B <N>` / `-A <N>` | Show N dialogue turns before/after each hit |
 | `--group-by session` | Group hits by session with title, hit count & best snippet |
 | `--count-by <axis>` | Histogram by `agent`, `role`, `project`, `actor`, or `session` |
@@ -112,12 +112,20 @@ Runs JSON-RPC 2.0 over stdio with automatic Hot Delta refresh (2s cooldown) and 
 | Tool | Purpose | Key Arguments |
 | :--- | :--- | :--- |
 | `search_history` | Full-text, fixed-string, or regex search | `query`, `agent`, `project`, `role`, `exclude_role`, `actor`, `session`, `since`, `until`, `case`, `fixed`, `regex`, `group_by`, `count_by`, `sort`, `no_subagents`, `limit`, `offset` |
-| `get_session_digest` | Condensed chronological user ↔ assistant stream | `session` *(required)*, `max_bytes`, `include_tools` |
+| `get_session_digest` | Condensed chronological user ↔ assistant stream | `session` *(required)*, `offset`, `max_bytes`, `include_tools` (long sessions show head + tail with the omitted range; ambiguous prefixes list candidates) |
 | `get_decision_timeline` | Oldest-first evolution of a topic across agents | `query` *(required)*, `agent`, `project`, `role`, `since`, `until`, `no_subagents`, `limit`, `offset` |
 | `get_session_context` | Surrounding dialogue turns around a `doc_id` | `doc_id` *(required)*, `window`, `max_bytes_per_item`, `include_tools` |
 | `get_document` | Full/paginated doc(s) or raw JSONL via `pread` | `doc_id` or `doc_ids` *(batch up to 16)*, `raw`, `offset`, `limit`, `tail` |
 | `list_sessions` | Recent sessions sorted by activity with titles | `agent`, `project`, `since`, `until`, `limit`, `offset` |
 | `search_file_history` | Sessions & actors that edited/created a file | `file`, `agent`, `project`, `session`, `since`, `until`, `no_subagents`, `limit`, `offset` |
+
+### Stable `doc_id`s
+
+A `doc_id` is a 48-bit key derived from the record itself (session id, transcript file name, line offset, role, and position within the line). The same record keeps the same `doc_id` across incremental syncs, `--compact`, and `--rebuild`, so ids saved in notes or earlier sessions stay valid. Upgrading from an index built by an older version triggers one automatic full rebuild, and ids from that older index no longer resolve.
+
+### Structured Results
+
+Every tool declares an `outputSchema` and returns `structuredContent` next to the text result: the same items with RFC 3339 timestamps (`2026-11-19T21:22:11+08:00`), short `@session` ids, `next_offset` for paging, and `notes` carrying the text hints. Error results are text only. Clients whose `clientInfo.name` contains `codex` get neither, because Codex shows `structuredContent` to the model in place of the text.
 
 ### Definitive Absence
 

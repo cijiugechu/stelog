@@ -191,6 +191,7 @@ static void test_end_to_end_base_delta_query_compact(void) {
     icfg.codex_home = codex_home;
     icfg.agy_home = agy_home;
     icfg.pi_home = pi_home;
+    icfg.droid_home = "/nonexistent/stelog-test-droid"; /* keeps ~/.factory out of fixtures */
     icfg.threads = 2;
 
     StelogIndexReport rep;
@@ -248,7 +249,11 @@ static void test_end_to_end_base_delta_query_compact(void) {
     q.sort_by_time = false;
     assert(stelog_index_search(idx, &q, &sr) == 0);
     assert(sr.total_matches == 1);
-    assert(stelog_doc_is_delta(sr.hits[0].doc_id) == true);
+    uint64_t mimalloc_id = sr.hits[0].doc_id;
+    uint64_t internal_id = 0;
+    assert(mimalloc_id > 0 && mimalloc_id <= STELOG_DOC_KEY_MASK);
+    assert(stelog_index_resolve_doc_id(idx, mimalloc_id, &internal_id) && stelog_doc_is_delta(internal_id));
+    assert(!stelog_index_resolve_doc_id(idx, stelog_make_doc_id(true, 0), NULL));
 
     /* 4e. Context window lookup via CSR session_idx.bin */
     q.query = "SwissTable";
@@ -286,7 +291,27 @@ static void test_end_to_end_base_delta_query_compact(void) {
     q.query = "mimalloc";
     assert(stelog_index_search(idx, &q, &sr) == 0);
     assert(sr.total_matches == 1);
-    assert(stelog_doc_is_delta(sr.hits[0].doc_id) == false); /* now inside Base gen 2! */
+    /* Moved into Base gen 2, but the public doc_id is unchanged */
+    assert(sr.hits[0].doc_id == mimalloc_id);
+    assert(stelog_index_resolve_doc_id(idx, mimalloc_id, &internal_id) && !stelog_doc_is_delta(internal_id));
+    q.query = "SwissTable";
+    assert(stelog_index_search(idx, &q, &sr) == 0);
+    assert(sr.count == 1 && sr.hits[0].doc_id == anchor_id);
+
+    /* 6. A full rebuild from the transcripts reproduces the same doc_ids */
+    icfg.force_compact = false;
+    icfg.force_rebuild = true;
+    assert(stelog_index_sync(&icfg, &rep) == 0);
+    assert(rep.was_rebuild == true);
+    assert(stelog_index_reload_if_changed(idx) == 1);
+    q.query = "mimalloc";
+    assert(stelog_index_search(idx, &q, &sr) == 0);
+    assert(sr.total_matches == 1 && sr.hits[0].doc_id == mimalloc_id);
+    q.query = "SwissTable";
+    assert(stelog_index_search(idx, &q, &sr) == 0);
+    assert(sr.count == 1 && sr.hits[0].doc_id == anchor_id);
+    assert(stelog_index_context(idx, anchor_id, 3, 1024, false, &ctx_res) == 0);
+    assert(ctx_res.count == 3 && ctx_res.items[ctx_res.anchor_index].doc_id == anchor_id); /* + appended mimalloc turn */
 
     stelog_index_close(idx);
     stelog_rmdir_recursive(root);

@@ -55,6 +55,7 @@ void stelog_agy_discover(const char *agy_home, StelogFileList *out_files);
 void stelog_agy_load_metadata(const char *agy_home, StelogMetaMap *out_meta);
 
 void stelog_pi_discover(const char *pi_home, StelogFileList *out_files);
+void stelog_droid_discover(const char *droid_home, StelogFileList *out_files);
 
 /* Exposed for unit testing chunk boundary invariance */
 int stelog_scan_single_file_for_test(const char *path,
