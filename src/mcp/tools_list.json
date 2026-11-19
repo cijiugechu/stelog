@@ -1,0 +1,237 @@
+{
+  "tools": [
+    {
+      "name": "search_history",
+      "description": "Search local coding agent history (Codex CLI, AGY CLI, Pi) to pinpoint when and who made a decision. BEST FIRST STEP: call with group_by='session' (e.g. query='中文 | english', group_by='session') to locate the right session(s) cleanly, then call get_session_digest. Default searches human prompts, assistant replies, inter-agent messages, and tool calls (excluding noisy tool outputs & injected prompts).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Keywords, `A | B` OR, `-term`/`-\"phrase\"` negation, `prefix*` wildcard, quoted phrases, or inline filters (`agent:agy role:user project:foo since:7d @sid8`)."
+          },
+          "case": {
+            "type": "string",
+            "description": "Case matching: smart (default: case-sensitive if query has uppercase), insensitive, or sensitive."
+          },
+          "fixed": {
+            "type": "boolean",
+            "description": "Literal fixed-string substring match (-F), disabling query syntax parsing."
+          },
+          "regex": {
+            "type": "boolean",
+            "description": "PCRE2 JIT regular expression match (-E) with automatic literal/index prefiltering."
+          },
+          "agent": {
+            "type": "string",
+            "description": "Comma-separated filter: codex, agy, pi."
+          },
+          "project": {
+            "type": "string",
+            "description": "Substring match against project/cwd path."
+          },
+          "role": {
+            "type": "string",
+            "description": "Comma-separated filter: user, assistant, inter_agent, tool_call, tool_result, thinking, system."
+          },
+          "exclude_role": {
+            "type": "string",
+            "description": "Comma-separated roles to exclude."
+          },
+          "actor": {
+            "type": "string",
+            "description": "Substring match against actor/model name."
+          },
+          "session": {
+            "type": "string",
+            "description": "Exact session id or short @prefix."
+          },
+          "since": {
+            "type": "string",
+            "description": "Start time: relative (7d, 24h) or ISO-8601."
+          },
+          "until": {
+            "type": "string",
+            "description": "End time: ISO-8601."
+          },
+          "sort": {
+            "type": "string",
+            "description": "relevance (default), oldest, or newest."
+          },
+          "group_by": {
+            "type": "string",
+            "description": "Set to 'session' to group hits by session with agent, date, title, hit count, and best snippet (ideal first step before get_session_digest)."
+          },
+          "count_by": {
+            "type": "string",
+            "description": "Return grouped counts by: agent, role, project, actor, session."
+          },
+          "no_subagents": {
+            "type": "boolean",
+            "description": "Exclude subagent transcripts."
+          },
+          "no_dedup": {
+            "type": "boolean",
+            "description": "Disable exact-duplicate folding across forked/retried transcripts."
+          },
+          "include_tools": {
+            "type": "boolean",
+            "description": "Include tool_result records."
+          },
+          "include_thinking": {
+            "type": "boolean",
+            "description": "Include model thinking/reasoning summaries."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max hits (default 20)."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Pagination offset."
+          }
+        }
+      }
+    },
+    {
+      "name": "get_session_digest",
+      "description": "Return the condensed chronological user<->assistant decision stream of a single session (by @prefix or full session_id). Collapses intermediate tool calls into counts, skips duplicate retries, and keeps ending options/conclusions intact within an inline-friendly byte budget.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "session": {
+            "type": "string",
+            "description": "Session UUID or short @prefix (e.g. @30c3cab1)."
+          },
+          "max_bytes": {
+            "type": "integer",
+            "description": "Optional text budget in bytes (default 7200). Omit this parameter to keep output inline; values >8000 may spill to disk and require an extra read turn."
+          },
+          "include_tools": {
+            "type": "boolean",
+            "description": "Include tool_call records instead of collapsing them."
+          }
+        },
+        "required": ["session"]
+      }
+    },
+    {
+      "name": "get_decision_timeline",
+      "description": "Return chronological (oldest-first) hits across MULTIPLE sessions for a topic. Do NOT call this in parallel with search_history(group_by='session'); prefer search_history(group_by='session') -> get_session_digest when investigating a feature or single-session decision.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Topic or keyword to trace over time."
+          },
+          "agent": { "type": "string" },
+          "project": { "type": "string" },
+          "role": { "type": "string" },
+          "since": { "type": "string" },
+          "until": { "type": "string" },
+          "no_subagents": { "type": "boolean" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        },
+        "required": ["query"]
+      }
+    },
+    {
+      "name": "get_session_context",
+      "description": "Fetch surrounding dialogue turns around a matched doc_id within the same session (collapses intermediate tool calls by default).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "doc_id": {
+            "type": "integer",
+            "description": "Document id returned by search_history or get_decision_timeline."
+          },
+          "window": {
+            "type": "integer",
+            "description": "Number of dialogue turns before and after anchor (default 5)."
+          },
+          "max_bytes_per_item": {
+            "type": "integer",
+            "description": "Max bytes per turn (default 1800)."
+          },
+          "include_tools": {
+            "type": "boolean",
+            "description": "Include tool calls instead of collapsing them."
+          }
+        },
+        "required": ["doc_id"]
+      }
+    },
+    {
+      "name": "get_document",
+      "description": "Read full or paginated content of one or more documents (pass doc_id, OR batch doc_ids:[id1,id2,...] up to 16 in a single call instead of scripting loops), or fetch raw JSONL via O(1) pread. Note: doc_ids include hidden tool_call records and are NOT contiguous dialogue turns — use get_session_context(doc_id) for neighboring dialogue instead of guessing adjacent doc_ids.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "doc_id": {
+            "type": "integer",
+            "description": "Single document ID."
+          },
+          "doc_ids": {
+            "type": "array",
+            "items": { "type": "integer" },
+            "description": "Batch of up to 16 document IDs to read in one call (preferred over loops)."
+          },
+          "raw": {
+            "type": "boolean",
+            "description": "Read raw JSONL line from original transcript file."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "Byte offset for pagination (single doc_id)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Max bytes per document (default 7200 for single doc, auto-budgeted for batch)."
+          },
+          "tail": {
+            "type": "boolean",
+            "description": "Read from the end (useful for error logs)."
+          }
+        }
+      }
+    },
+    {
+      "name": "list_sessions",
+      "description": "List local Codex, AGY, and Pi sessions sorted by most recent activity, with auto-extracted titles.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "agent": { "type": "string" },
+          "project": { "type": "string" },
+          "since": { "type": "string" },
+          "until": { "type": "string" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        }
+      }
+    },
+    {
+      "name": "search_file_history",
+      "description": "Find which sessions, when, and who created or edited files matching a path substring.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "File path or filename substring (e.g. rate_limit.rs or DESIGN.md)."
+          },
+          "agent": { "type": "string" },
+          "project": { "type": "string" },
+          "session": { "type": "string" },
+          "since": { "type": "string" },
+          "until": { "type": "string" },
+          "no_subagents": { "type": "boolean" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,56 @@
+#ifndef STELOG_PCRE2_CONFIG_H
+#define STELOG_PCRE2_CONFIG_H
+
+#define HAVE_ASSERT_H 1
+#define HAVE_BUILTIN_MUL_OVERFLOW 1
+#define HAVE_BUILTIN_UNREACHABLE 1
+#define HAVE_DIRENT_H 1
+#define HAVE_INTTYPES_H 1
+#define HAVE_LIMITS_H 1
+#define HAVE_MEMMOVE 1
+#define HAVE_PTHREAD 1
+#define HAVE_STDINT_H 1
+#define HAVE_STDIO_H 1
+#define HAVE_STDLIB_H 1
+#define HAVE_STRERROR 1
+#define HAVE_STRINGS_H 1
+#define HAVE_STRING_H 1
+#define HAVE_SYS_STAT_H 1
+#define HAVE_SYS_TYPES_H 1
+#define HAVE_UNISTD_H 1
+#define HAVE_WCHAR_H 1
+#define STDC_HEADERS 1
+
+#define PCRE2_STATIC 1
+#define SUPPORT_PCRE2_8 1
+#define SUPPORT_UNICODE 1
+#define SUPPORT_JIT 1
+
+#define LINK_SIZE 2
+#define HEAP_LIMIT 20000000
+#define MATCH_LIMIT 10000000
+#define MATCH_LIMIT_DEPTH MATCH_LIMIT
+#define MAX_NAME_COUNT 10000
+#define MAX_NAME_SIZE 128
+#define MAX_VARLOOKBEHIND 255
+#define NEWLINE_DEFAULT 2
+#define PARENS_NEST_LIMIT 250
+#define PCRE2_EXPORT
+
+#define PACKAGE "pcre2"
+#define PACKAGE_NAME "PCRE2"
+#define PACKAGE_STRING "PCRE2 10.45"
+#define PACKAGE_TARNAME "pcre2"
+#define PACKAGE_VERSION "10.45"
+
+#ifdef __APPLE__
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+#else
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+#endif
+
+#endif /* STELOG_PCRE2_CONFIG_H */
