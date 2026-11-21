@@ -23,8 +23,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/stelog --version
 
 # Optional: install to ~/.local/bin
-mkdir -p ~/.local/bin
-cp zig-out/bin/stelog ~/.local/bin/stelog
+zig build -Doptimize=ReleaseFast --prefix ~/.local
 ```
 
 To build for a different platform, choose the corresponding target below.
@@ -79,3 +78,8 @@ An agent skill with recommended tool-calling patterns is bundled at [skills/stel
 
 - **User Guide & Syntax Cheatsheet**: [docs/USAGE.md](docs/USAGE.md)
 - **Agent Skill**: [skills/stelog/SKILL.md](skills/stelog/SKILL.md)
+
+## License
+
+stelog's original code is licensed under the [Apache License, Version 2.0](LICENSE).
+Bundled libraries retain their respective licenses. See [third-party notices](THIRD_PARTY_NOTICES).

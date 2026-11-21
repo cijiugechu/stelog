@@ -268,6 +268,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
     b.installArtifact(exe);
+    b.installFile("LICENSE", "share/licenses/stelog/LICENSE");
+    b.installFile("THIRD_PARTY_NOTICES", "share/licenses/stelog/THIRD_PARTY_NOTICES");
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
