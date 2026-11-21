@@ -1,14 +1,6 @@
 # stelog
 
-Ultra-fast local history search and decision archaeology across coding agents (**Codex CLI**, **AGY CLI**, **Pi**, and **Factory Droid**).
-
-One **2.8 MB** static binary provides both a `ripgrep`-inspired CLI and a stdio **MCP Server** (`stelog mcp`) backed by a Data-Oriented `mmap` index — microsecond queries, automatic Hot Delta refresh, no background daemon.
-
-## Why stelog
-
-- **Purified decision signal**: Strips 90%+ transcript noise (`compacted` snapshots, duplicate events, harness-injected `AGENTS.md` / `<environment_context>` prompts labeled `role:user`, huge tool outputs) while keeping O(1) `pread` access to raw JSONL records.
-- **Microsecond queries**: Columnar SoA `mmap`, NEON/SSE2 SwissTable + Roaring bitmaps, SIMD substring search, and PCRE2 JIT regex with automatic literal prefiltering (P50 **~11 µs** exact, **~380 µs** regex on 1.57 GB of transcripts; zero heap allocation on hot queries).
-- **Zero-dependency deployment**: Pure C11/C++17 core with vendored `simdjson`, `simdutf`, `pcre2`, `zstd`, and `sqlite3`. Cross-compiles cleanly to macOS and Linux (ARM64 & x86_64).
+Search your local coding-agent conversations to find past decisions, revisit what changed in a file, or read a condensed session history.
 
 ## Supported Transcript Sources
 
@@ -24,20 +16,18 @@ One **2.8 MB** static binary provides both a `ripgrep`-inspired CLI and a stdio 
 Requires **Zig 0.16+**.
 
 ```bash
-# Build native ReleaseFast binary -> ./zig-out/bin/stelog
+# Build stelog
 zig build -Doptimize=ReleaseFast
 
-# Show the version and build commit (unknown for a source archive without Git metadata)
+# Check the version
 ./zig-out/bin/stelog --version
 
-# Run all unit & integration tests
-zig build test -Doptimize=ReleaseFast
-
 # Optional: install to ~/.local/bin
+mkdir -p ~/.local/bin
 cp zig-out/bin/stelog ~/.local/bin/stelog
 ```
 
-Cross-compile static binaries for other targets:
+To build for a different platform, choose the corresponding target below.
 
 ```bash
 zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl
@@ -49,21 +39,23 @@ zig build -Doptimize=ReleaseFast -Dtarget=aarch64-macos
 ## Quickstart
 
 ```bash
-# 1. Build (or incrementally sync) the local index
+# Prepare your history for search or refresh it after a session
 stelog index
 
-# 2. Best 2-step decision archaeology workflow:
-#    Step A: find which session(s) made the decision (bilingual OR + negation)
+# Find sessions mentioning “镜像” or “mirror” and exclude “docker”
 stelog search "镜像 | mirror -docker" . --group-by session
 
-#    Step B: read that session's condensed user <-> assistant decision stream
+# Read a condensed conversation using a session ID from the results
 stelog digest @30c3cab1
 
-# 3. Other essentials
-stelog timeline "simdutf | roaring" .           # chronological evolution
-stelog files roaring.c .                        # who edited a file and when
-stelog search -E 'qz[0-9]{4,}[a-z]?' -C 1       # PCRE2 JIT regex + inline context
-stelog bench                                    # 6-suite latency & 0-malloc benchmark
+# Follow mentions of a topic over time
+stelog timeline "镜像 | mirror" .
+
+# Find sessions that touched a file
+stelog files README.md .
+
+# Search with a regular expression and show surrounding context
+stelog search -E 'qz[0-9]{4,}[a-z]?' -C 1
 ```
 
 ## MCP Server & Agent Skill
